@@ -168,6 +168,7 @@ def run(
     config: CampaignConfig,
     vertical: bool = True,
     enable_zoom: bool = True,
+    browser: str = "firefox",
 ) -> Path:
     """
     Main pipeline execution.
@@ -193,7 +194,7 @@ def run(
     if is_url(source):
         console.print("[cyan]Downloading VOD...")
         try:
-            vod = str(download(source))
+            vod = str(download(source, browser=browser))
         except Exception as e:
             console.print(f"[red]Failed to download VOD: {e}")
             return OUT_DIR
@@ -321,6 +322,11 @@ def main():
         action="store_true",
         help="List all available editing styles and exit",
     )
+    parser.add_argument(
+        "--browser",
+        default="firefox",
+        help="Browser to extract cookies from for Kick downloads (default: firefox)",
+    )
     args = parser.parse_args()
 
     # Handle --list-styles
@@ -412,7 +418,7 @@ def main():
 
     vertical = not args.horizontal
     enable_zoom = not args.no_zoom
-    run(args.vod, transcript, config, vertical, enable_zoom)
+    run(args.vod, transcript, config, vertical, enable_zoom, args.browser)
 
 
 if __name__ == "__main__":

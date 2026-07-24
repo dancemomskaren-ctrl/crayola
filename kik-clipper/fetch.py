@@ -89,13 +89,14 @@ def run_with_retry(
     raise RuntimeError(f"{description} failed after {max_retries} attempts")
 
 
-def download(url: str, output: Optional[str] = None) -> Path:
+def download(url: str, output: Optional[str] = None, browser: str = "firefox") -> Path:
     """
     Download a video from URL using yt-dlp.
 
     Args:
         url: Video URL (Kick.com or other supported platforms)
         output: Output file path (defaults to output/vod.mp4)
+        browser: Browser to extract cookies from (firefox, chrome, etc.)
 
     Returns:
         Path to downloaded file
@@ -105,17 +106,18 @@ def download(url: str, output: Optional[str] = None) -> Path:
         output = str(OUT_DIR / "vod.mp4")
 
     if "kick.com" in url or "kik.com" in url:
-        return download_kick(url, output)
+        return download_kick(url, output, browser)
     return download_generic(url, output)
 
 
-def download_kick(url: str, output: str) -> Path:
+def download_kick(url: str, output: str, browser: str = "firefox") -> Path:
     """
     Download from Kick.com using browser cookies for authentication.
 
     Args:
         url: Kick.com video URL
         output: Output file path
+        browser: Browser to extract cookies from (firefox, chrome, etc.)
 
     Returns:
         Path to downloaded file
@@ -123,7 +125,7 @@ def download_kick(url: str, output: str) -> Path:
     cmd = [
         "yt-dlp",
         "--cookies-from-browser",
-        "chrome",
+        browser,
         "-f",
         "best",
         "-o",
