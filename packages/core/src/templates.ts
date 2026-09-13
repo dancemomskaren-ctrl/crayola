@@ -2,7 +2,7 @@ export interface Template {
   id: string;
   name: string;
   desc: string;
-  category: "story" | "conversation" | "quiz" | "reaction" | "educational";
+  category: "story" | "conversation" | "quiz" | "reaction" | "educational" | "ministry";
   icon: string;
   defaults: Record<string, any>;
   fields: TemplateField[];
@@ -77,14 +77,31 @@ export const TEMPLATES: Template[] = [
         label: "Caption Style",
         type: "select",
         options: [
-          { value: "bold_pop", label: "Bold Pop" },
+          // Traditional ASS styles
+          { value: "bold_pop", label: "Bold Pop (classic)" },
           { value: "typewriter", label: "Typewriter" },
           { value: "bounce", label: "Bounce" },
           { value: "zoom", label: "Zoom" },
           { value: "word_by_word", label: "Word by Word" },
           { value: "colorful", label: "Colorful" },
+          
+          // Viral styles (MrBeast, Hormozi, etc.)
+          { value: "viral_mrbeast", label: "🔥 MrBeast (yellow pop)" },
+          { value: "viral_hormozi", label: "💼 Hormozi (cyan bold)" },
+          { value: "viral_karaoke", label: "🎤 Karaoke (color wipe)" },
+          { value: "viral_minimal", label: "✨ Minimal (clean scale)" },
+          { value: "viral_classic", label: "⚡ Classic (viral yellow)" },
+          
+          // Scattered word styles (aesthetic edits)
+          { value: "scattered_clean", label: "🎨 Scattered - Clean" },
+          { value: "scattered_neon", label: "🎮 Scattered - Neon" },
+          { value: "scattered_pastel", label: "🌸 Scattered - Pastel" },
+          { value: "scattered_bold", label: "💥 Scattered - Bold" },
+          { value: "scattered_handwritten", label: "✍️ Scattered - Handwritten" },
+          
+          { value: "none", label: "No captions" },
         ],
-        default: "bold_pop",
+        default: "viral_mrbeast",
       },
       {
         key: "quality",
@@ -688,7 +705,7 @@ export const TEMPLATES: Template[] = [
   {
     id: "auto_clip",
     name: "Auto Clip",
-    desc: "Paste a YouTube URL → auto-detect best moments → extract highlight clips",
+    desc: "Paste a YouTube URL → auto-detect genre + best moments → extract clips",
     category: "story",
     icon: "✂️",
     defaults: {
@@ -707,13 +724,15 @@ export const TEMPLATES: Template[] = [
       smartZoom: false,
       voiceVolume: 1.0,
       musicVolume: 0.15,
+      autoGenre: true,
+      selectedGenres: [],
     },
     fields: [
       {
         key: "url",
-        label: "YouTube / TikTok URL",
+        label: "YouTube / TikTok URL or Upload MP4",
         type: "text",
-        placeholder: "https://youtube.com/watch?v=...",
+        placeholder: "https://youtube.com/watch?v=... or upload mp4",
       },
       {
         key: "platform",
@@ -727,11 +746,24 @@ export const TEMPLATES: Template[] = [
         default: "9:16",
       },
       {
+        key: "autoGenre",
+        label: "Auto-Detect Genre",
+        type: "toggle",
+        default: true,
+      },
+      {
+        key: "selectedGenres",
+        label: "Select Genres (if not auto-detect)",
+        type: "text",
+        placeholder: "sermon, church_promo, testimony, worship, teaching, devotional, youth, kids, event",
+        default: [],
+      },
+      {
         key: "clipCount",
         label: "Number of Clips",
         type: "slider",
         min: 1,
-        max: 10,
+        max: 50,
         step: 1,
         default: 5,
       },
@@ -759,6 +791,11 @@ export const TEMPLATES: Template[] = [
         type: "select",
         options: [
           { value: "bold_pop", label: "Bold Pop" },
+          { value: "holy_glow", label: "Holy Glow" },
+          { value: "cross_bold", label: "Cross Bold" },
+          { value: "worship_purple", label: "Worship Purple" },
+          { value: "scripture_serif", label: "Scripture Serif" },
+          { value: "fire_revival", label: "Fire Revival" },
           { value: "typewriter", label: "Typewriter" },
           { value: "bounce", label: "Bounce" },
           { value: "word_by_word", label: "Word by Word" },
@@ -778,12 +815,24 @@ export const TEMPLATES: Template[] = [
         ],
         default: "standard",
       },
+      {
+        key: "smartTitle",
+        label: "AI Generate Titles",
+        type: "toggle",
+        default: true,
+      },
+      {
+        key: "titleOverride",
+        label: "Custom Title (overrides AI)",
+        type: "text",
+        placeholder: "Leave empty for AI-generated",
+      },
     ],
   },
   {
     id: "sermon_clip",
-    name: "Sermon Clip",
-    desc: "YouTube sermon → auto-detect highlights → captioned clips with hook intro",
+    name: "Sermon Clip (Christian Agency Template)",
+    desc: "YouTube sermon → auto-detect highlights → captioned clips with hook intro and Christian styling",
     category: "story",
     icon: "⛪",
     defaults: {
@@ -795,14 +844,14 @@ export const TEMPLATES: Template[] = [
       voiceover: false,
       bgVideo: true,
       bgMusic: false,
-      captionStyle: "bold_pop",
+      captionStyle: "holy_glow",
       platform: "9:16",
       quality: "standard",
       transition: "crossfade",
       smartZoom: true,
       voiceVolume: 1.0,
       musicVolume: 0.15,
-      hookIntro: "Watch this...",
+      hookIntro: "This sermon changed everything...",
       silenceRemoval: false,
     },
     fields: [
@@ -834,7 +883,7 @@ export const TEMPLATES: Template[] = [
         label: "Number of Clips",
         type: "slider",
         min: 1,
-        max: 10,
+        max: 50,
         step: 1,
         default: 5,
       },
@@ -861,15 +910,18 @@ export const TEMPLATES: Template[] = [
         label: "Caption Style",
         type: "select",
         options: [
+          { value: "holy_glow", label: "Holy Glow (reverent)" },
+          { value: "cross_bold", label: "Cross Bold (strong)" },
+          { value: "worship_purple", label: "Worship Purple (praise)" },
+          { value: "scripture_serif", label: "Scripture Serif (traditional)" },
+          { value: "fire_revival", label: "Fire Revival (passion)" },
           { value: "bold_pop", label: "Bold Pop" },
           { value: "typewriter", label: "Typewriter" },
           { value: "bounce", label: "Bounce" },
           { value: "word_by_word", label: "Word by Word" },
           { value: "colorful", label: "Colorful" },
-          { value: "glow", label: "Glow" },
-          { value: "neon", label: "Neon" },
         ],
-        default: "bold_pop",
+        default: "holy_glow",
       },
       {
         key: "quality",
@@ -1048,8 +1100,99 @@ export const TEMPLATES: Template[] = [
       },
     ],
   },
+  // ─── Ministry-specific templates ───
   {
-    id: "testimony",
+    id: "sermon_teaching",
+    name: "Sermon Teaching Clip",
+    desc: "Extract key teaching point → scripture reference + application",
+    category: "ministry",
+    icon: "📖",
+    defaults: {
+      type: "teaching_clip",
+      clipCount: 3,
+      minDuration: 20,
+      maxDuration: 60,
+      captionStyle: "holy_glow",
+      platform: "9:16",
+      quality: "standard",
+      transition: "crossfade",
+      smartZoom: true,
+      voiceVolume: 1.0,
+      musicVolume: 0.12,
+      hookIntro: "Here's what Scripture says about...",
+      bgMusic: "worship",
+      scriptureOverlay: true,
+    },
+    fields: [
+      { key: "url", label: "Sermon URL", type: "text", placeholder: "https://youtube.com/watch?v=..." },
+      { key: "scripture", label: "Bible Reference", type: "text", placeholder: "Matthew 11:28" },
+      {
+        key: "captionStyle",
+        label: "Caption Style",
+        type: "select",
+        options: [
+          { value: "holy_glow", label: "Holy Glow (reverent)" },
+          { value: "cross_bold", label: "Cross Bold (strong)" },
+          { value: "scripture_serif", label: "Scripture Serif (traditional)" },
+        ],
+        default: "holy_glow",
+      },
+    ],
+  },
+  {
+    id: "worship_moment",
+    name: "Worship Moment Clip",
+    desc: "Worship performance → lyrical highlight + call to engage",
+    category: "ministry",
+    icon: "🎤",
+    defaults: {
+      type: "worship_clip",
+      clipCount: 1,
+      minDuration: 30,
+      maxDuration: 60,
+      captionStyle: "worship_purple",
+      platform: "9:16",
+      quality: "high",
+      transition: "none",
+      voiceVolume: 0.5,
+      musicVolume: 0.5,
+      hookIntro: "This song will bless you...",
+      bgMusic: "worship",
+    },
+    fields: [
+      { key: "url", label: "Worship Performance URL", type: "text" },
+      { key: "songTitle", label: "Song Title", type: "text", placeholder: "What a Beautiful Name" },
+      { key: "artist", label: "Artist/Band", type: "text" },
+    ],
+  },
+  {
+    id: "pastor_short",
+    name: "Pastor Short Clip",
+    desc: "Pastor's quote or insight → quick encouragement + church branding",
+    category: "ministry",
+    icon: "👨‍💼",
+    defaults: {
+      type: "quote",
+      clipCount: 1,
+      minDuration: 15,
+      maxDuration: 45,
+      captionStyle: "cross_bold",
+      platform: "9:16",
+      quality: "standard",
+      transition: "none",
+      smartZoom: true,
+      voiceVolume: 1.0,
+      musicVolume: 0.15,
+      hookIntro: "Our pastor said it best...",
+      bgMusic: "ambient",
+    },
+    fields: [
+      { key: "url", label: "Sermon or Message URL", type: "text" },
+      { key: "pastor", label: "Pastor Name", type: "text", placeholder: "Pastor Mike" },
+      { key: "churchName", label: "Church Name", type: "text", placeholder: "Grace Community Church" },
+    ],
+  },
+  {
     name: "Testimony",
     desc: "Personal testimony with emotional captions + dramatic music",
     category: "story",
@@ -1214,7 +1357,7 @@ export const TEMPLATES: Template[] = [
         label: "Number of Clips",
         type: "slider",
         min: 1,
-        max: 10,
+        max: 50,
         step: 1,
         default: 5,
       },
@@ -1505,6 +1648,230 @@ export const TEMPLATES: Template[] = [
       },
     ],
   },
+  {
+    id: "standup_comedy",
+    name: "Standup Comedy",
+    desc: "Comedy special → highlight clips with punch-up captions, laugh-reactive timing, and audience-reactive zoom cuts",
+    category: "reaction",
+    icon: "🎤",
+    defaults: {
+      type: "story",
+      bgVideo: false,
+      bgMusic: true,
+      captionStyle: "bold_pop",
+      platform: "9:16",
+      quality: "standard",
+      transition: "zoom_cut",
+      smartZoom: true,
+      voiceVolume: 1.0,
+      musicVolume: 0.2,
+      // Comedy-specific defaults
+      extendForLaughter: true,
+      zoomOnLaughter: true,
+      punchUpCaptions: true,
+      titleStyle: "bold_pop",
+      hookIntro: "Wait... until you hear this",
+      clipCount: 5,
+      minDuration: 30,
+      maxDuration: 90,
+    },
+    fields: [
+      {
+        key: "url",
+        label: "YouTube URL (or upload mp4 below)",
+        type: "text",
+        placeholder: "https://youtube.com/watch?v=...",
+      },
+      {
+        key: "clipCount",
+        label: "Number of Clips",
+        type: "slider",
+        min: 1,
+        max: 50,
+        step: 1,
+        default: 5,
+      },
+      {
+        key: "minDuration",
+        label: "Min Clip Length (sec)",
+        type: "slider",
+        min: 15,
+        max: 60,
+        step: 5,
+        default: 30,
+      },
+      {
+        key: "maxDuration",
+        label: "Max Clip Length (sec)",
+        type: "slider",
+        min: 30,
+        max: 180,
+        step: 10,
+        default: 90,
+      },
+      {
+        key: "captionStyle",
+        label: "Caption Style",
+        type: "select",
+        options: [
+          // Traditional ASS styles
+          { value: "bold_pop", label: "Bold Pop (title + captions)" },
+          { value: "colorful", label: "Colorful (vibrant)" },
+          { value: "neon", label: "Neon (glowing)" },
+          { value: "bounce", label: "Bounce (energetic)" },
+          { value: "word_by_word", label: "Word-by-Word (synced)" },
+          
+          // Viral styles
+          { value: "viral_mrbeast", label: "🔥 MrBeast (yellow pop)" },
+          { value: "viral_hormozi", label: "💼 Hormozi (cyan bold)" },
+          { value: "viral_classic", label: "⚡ Classic (viral yellow)" },
+          
+          // Scattered word styles (aesthetic edits)
+          { value: "scattered_clean", label: "🎨 Scattered - Clean" },
+          { value: "scattered_neon", label: "🎮 Scattered - Neon" },
+          { value: "scattered_bold", label: "💥 Scattered - Bold" },
+          
+          { value: "none", label: "No captions" },
+        ],
+        default: "viral_mrbeast",
+      },
+      {
+        key: "platform",
+        label: "Platform Format",
+        type: "select",
+        options: [
+          { value: "9:16", label: "TikTok / Shorts / Reels (9:16)" },
+          { value: "1:1", label: "Instagram Feed (1:1)" },
+        ],
+        default: "9:16",
+      },
+      {
+        key: "quality",
+        label: "Export Quality",
+        type: "select",
+        options: [
+          { value: "draft", label: "Draft (720p, fast)" },
+          { value: "standard", label: "Standard (1080p)" },
+          { value: "high", label: "High (1080p, slow)" },
+          { value: "ultra", label: "Ultra (4K, slow)" },
+        ],
+        default: "standard",
+      },
+    ],
+  },
+  
+  // ═══ Music Edit ═══
+  {
+    id: "music-edit",
+    name: "Music Edit",
+    desc: "Auto-cut video clips to music beats (aesthetic edits, AMV, GMV)",
+    category: "story",
+    icon: "🎵",
+    defaults: {
+      platform: "9:16",
+      quality: "high",
+      captionStyle: "scattered_neon",
+      cutDensity: "auto",
+      minClipLength: 0.5,
+      maxClipLength: 4,
+      transitionStyle: "cut",
+    },
+    fields: [
+      {
+        key: "audioFile",
+        label: "Music Track",
+        type: "text",
+        placeholder: "Upload music track URL or path",
+      },
+      {
+        key: "sourceVideos",
+        label: "Source Videos (comma-separated paths)",
+        type: "textarea",
+        placeholder: "/path/to/video1.mp4,/path/to/video2.mp4",
+      },
+      {
+        key: "platform",
+        label: "Platform Format",
+        type: "select",
+        options: [
+          { value: "9:16", label: "TikTok/Shorts (9:16)" },
+          { value: "1:1", label: "Instagram Square (1:1)" },
+          { value: "16:9", label: "YouTube (16:9)" },
+        ],
+        default: "9:16",
+      },
+      {
+        key: "cutDensity",
+        label: "Cut Density",
+        type: "select",
+        options: [
+          { value: "auto", label: "Auto (follows music energy)" },
+          { value: "low", label: "Low (slow cuts)" },
+          { value: "medium", label: "Medium" },
+          { value: "high", label: "High (fast cuts)" },
+        ],
+        default: "auto",
+      },
+      {
+        key: "minClipLength",
+        label: "Min Clip Length (sec)",
+        type: "slider",
+        min: 0.25,
+        max: 2,
+        step: 0.25,
+        default: 0.5,
+      },
+      {
+        key: "maxClipLength",
+        label: "Max Clip Length (sec)",
+        type: "slider",
+        min: 1,
+        max: 10,
+        step: 0.5,
+        default: 4,
+      },
+      {
+        key: "captionStyle",
+        label: "Caption Style",
+        type: "select",
+        options: [
+          { value: "none", label: "No captions" },
+          { value: "scattered_neon", label: "🎮 Scattered - Neon" },
+          { value: "scattered_clean", label: "🎨 Scattered - Clean" },
+          { value: "scattered_pastel", label: "🌸 Scattered - Pastel" },
+          { value: "viral_mrbeast", label: "🔥 MrBeast" },
+        ],
+        default: "scattered_neon",
+      },
+      {
+        key: "transitionStyle",
+        label: "Transition Style",
+        type: "select",
+        options: [
+          { value: "cut", label: "Hard Cut (instant)" },
+          { value: "fade", label: "Fade (crossfade)" },
+          { value: "dissolve", label: "Dissolve (blend)" },
+          { value: "zoom_in", label: "Zoom In (circle crop)" },
+          { value: "zoom_out", label: "Zoom Out (circle open)" },
+          { value: "slide_left", label: "Slide Left" },
+          { value: "slide_right", label: "Slide Right" },
+        ],
+        default: "cut",
+      },
+      {
+        key: "quality",
+        label: "Export Quality",
+        type: "select",
+        options: [
+          { value: "draft", label: "Draft (720p)" },
+          { value: "standard", label: "Standard (1080p)" },
+          { value: "high", label: "High (1080p, CRF 18)" },
+          { value: "ultra", label: "Ultra (4K)" },
+        ],
+        default: "high",
+      },
+    ],
+  },
 ];
 
 export function getTemplate(id: string): Template | undefined {
@@ -1514,3 +1881,385 @@ export function getTemplate(id: string): Template | undefined {
 export function getTemplatesByCategory(category: string): Template[] {
   return TEMPLATES.filter((t) => t.category === category);
 }
+
+export const CHRISTIAN_TEMPLATES: Template[] = [
+  // 1. Sunday Sermon Highlights
+  {
+    id: "sermon_highlight",
+    name: "Sunday Sermon Highlights",
+    desc: "Extract 3-5 powerful moments from full sermon → vertical clips with scripture overlays",
+    category: "ministry",
+    icon: "⛪",
+    defaults: {
+      type: "sermon_clip",
+      clipCount: 5,
+      minDuration: 20,
+      maxDuration: 60,
+      captionStyle: "holy_glow",
+      platform: "9:16",
+      quality: "standard",
+      bgMusic: "worship",
+      scriptureOverlay: true,
+      voiceVolume: 1.0,
+      musicVolume: 0.12,
+    },
+    fields: [
+      { key: "url", label: "Sermon YouTube URL", type: "text", placeholder: "https://youtube.com/watch?v=..." },
+      { key: "sermonTitle", label: "Sermon Title", type: "text", placeholder: "The Power of Prayer" },
+      { key: "pastor", label: "Pastor Name", type: "text", placeholder: "Pastor John Smith" },
+      { key: "scripture", label: "Key Scriptures (comma-separated)", type: "text", placeholder: "John 3:16, Romans 8:28" },
+      {
+        key: "captionStyle",
+        label: "Caption Style",
+        type: "select",
+        options: [
+          { value: "holy_glow", label: "Holy Glow (reverent)" },
+          { value: "cross_bold", label: "Cross Bold (strong)" },
+          { value: "worship_purple", label: "Worship Purple (praise)" },
+        ],
+        default: "holy_glow",
+      },
+    ],
+  },
+
+  // 2. Testimony Short
+  {
+    id: "testimony_short",
+    name: "Testimony Story",
+    desc: "Personal testimony → emotional hook + transformation + call-to-action",
+    category: "ministry",
+    icon: "🙏",
+    defaults: {
+      type: "story",
+      clipCount: 1,
+      minDuration: 30,
+      maxDuration: 90,
+      captionStyle: "worship_purple",
+      platform: "9:16",
+      hookIntro: "My testimony will blow your mind...",
+      bgMusic: "ambient",
+      emotionDetection: true,
+    },
+    fields: [
+      { key: "url", label: "Testimony Video URL or Upload", type: "text" },
+      { key: "hookIntro", label: "Hook Text", type: "text", placeholder: "This changed my life..." },
+      { key: "callToAction", label: "End CTA", type: "text", placeholder: "Share your testimony below!" },
+    ],
+  },
+
+  // 3. Worship Lyric Video
+  {
+    id: "worship_lyrics",
+    name: "Worship Lyrics Video",
+    desc: "Worship song → synchronized animated lyrics with aesthetic background",
+    category: "ministry",
+    icon: "🎵",
+    defaults: {
+      type: "lyric_video",
+      captionStyle: "worship_purple",
+      platform: "9:16",
+      quality: "high",
+      bgVideo: "worship_abstract",
+      textAnimation: "fade_in_out",
+    },
+    fields: [
+      { key: "audioUrl", label: "Worship Song Audio", type: "text" },
+      { key: "songTitle", label: "Song Title", type: "text" },
+      { key: "artist", label: "Artist/Band", type: "text" },
+      { key: "lyrics", label: "Lyrics (one line per box)", type: "textarea" },
+    ],
+  },
+
+  // 4. Bible Verse Animation
+  {
+    id: "verse_animation",
+    name: "Bible Verse Animation",
+    desc: "Single scripture → cinematic background + elegant typography",
+    category: "ministry",
+    icon: "📖",
+    defaults: {
+      type: "verse_overlay",
+      captionStyle: "scripture_serif",
+      platform: "1:1",
+      duration: 8,
+      bgVideo: "nature_worship",
+      textAnimation: "typewriter",
+    },
+    fields: [
+      { key: "verse", label: "Bible Verse", type: "textarea", placeholder: "For God so loved the world..." },
+      { key: "reference", label: "Reference", type: "text", placeholder: "John 3:16" },
+      { key: "bgTheme", label: "Background", type: "select", options: [
+        { value: "nature_worship", label: "Nature" },
+        { value: "cross_sunset", label: "Cross at Sunset" },
+        { value: "church_interior", label: "Church Interior" },
+        { value: "abstract_light", label: "Abstract Light" },
+      ]},
+    ],
+  },
+
+  // 5. Prayer Request Callout
+  {
+    id: "prayer_request",
+    name: "Prayer Request",
+    desc: "Community prayer invitation → soft music + centered text",
+    category: "ministry",
+    icon: "🤲",
+    defaults: {
+      type: "text_overlay",
+      captionStyle: "holy_glow",
+      platform: "1:1",
+      duration: 10,
+      bgMusic: "ambient",
+      bgVideo: "candle_prayer",
+    },
+    fields: [
+      { key: "prayerText", label: "Prayer Request Text", type: "textarea", placeholder: "Praying for healing..." },
+      { key: "churchName", label: "Church Name", type: "text" },
+    ],
+  },
+
+  // 6. Weekly Devotional
+  {
+    id: "daily_devotional",
+    name: "Daily/Weekly Devotional",
+    desc: "Short teaching moment → verse + application + prayer",
+    category: "ministry",
+    icon: "☀️",
+    defaults: {
+      type: "devotional",
+      clipCount: 1,
+      minDuration: 45,
+      maxDuration: 90,
+      captionStyle: "cross_bold",
+      platform: "9:16",
+      scriptureOverlay: true,
+    },
+    fields: [
+      { key: "url", label: "Devotional Video URL", type: "text" },
+      { key: "title", label: "Devotional Title", type: "text", placeholder: "Monday Morning Encouragement" },
+      { key: "scripture", label: "Key Verse", type: "text", placeholder: "Philippians 4:13" },
+    ],
+  },
+
+  // 7. Altar Call / Salvation Invitation
+  {
+    id: "altar_call",
+    name: "Altar Call / Salvation",
+    desc: "Gospel presentation → powerful call to accept Christ",
+    category: "ministry",
+    icon: "✝️",
+    defaults: {
+      type: "sermon_clip",
+      clipCount: 1,
+      minDuration: 60,
+      maxDuration: 120,
+      captionStyle: "fire_revival",
+      platform: "9:16",
+      bgMusic: "soft_worship",
+      emotionDetection: true,
+    },
+    fields: [
+      { key: "url", label: "Sermon/Message URL", type: "text" },
+      { key: "callToAction", label: "End CTA", type: "text", placeholder: "Accept Jesus today!" },
+    ],
+  },
+
+  // 8. Kids Ministry Moment
+  {
+    id: "kids_ministry",
+    name: "Kids Ministry Clip",
+    desc: "Children's lesson → colorful, upbeat, short attention span friendly",
+    category: "ministry",
+    icon: "👶",
+    defaults: {
+      type: "kids_clip",
+      clipCount: 3,
+      minDuration: 15,
+      maxDuration: 45,
+      captionStyle: "colorful",
+      platform: "9:16",
+      bgMusic: "upbeat",
+      transitions: "bounce",
+    },
+    fields: [
+      { key: "url", label: "Kids Ministry Video URL", type: "text" },
+      { key: "lessonTitle", label: "Lesson Title", type: "text", placeholder: "David and Goliath" },
+    ],
+  },
+
+  // 9. Youth Group Hype
+  {
+    id: "youth_group",
+    name: "Youth Group Hype",
+    desc: "Youth ministry event → high energy, modern style, peer-focused",
+    category: "ministry",
+    icon: "🔥",
+    defaults: {
+      type: "youth_clip",
+      clipCount: 5,
+      minDuration: 10,
+      maxDuration: 30,
+      captionStyle: "fire_revival",
+      platform: "9:16",
+      bgMusic: "energetic",
+      transitions: "fast",
+      textSpeed: "fast",
+    },
+    fields: [
+      { key: "url", label: "Youth Event Video", type: "text" },
+      { key: "eventName", label: "Event Name", type: "text", placeholder: "Summer Camp 2026" },
+    ],
+  },
+
+  // 10. Baptism Announcement
+  {
+    id: "baptism_announcement",
+    name: "Baptism Announcement",
+    desc: "Baptism celebration → joyful, celebratory, invitation to next baptism",
+    category: "ministry",
+    icon: "💧",
+    defaults: {
+      type: "celebration",
+      clipCount: 1,
+      minDuration: 20,
+      maxDuration: 60,
+      captionStyle: "worship_purple",
+      platform: "9:16",
+      bgMusic: "worship",
+      transitions: "crossfade",
+    },
+    fields: [
+      { key: "url", label: "Baptism Video", type: "text" },
+      { key: "baptismDate", label: "Next Baptism Date", type: "text", placeholder: "Sunday, March 15" },
+    ],
+  },
+
+  // 11. Mission Trip Recap
+  {
+    id: "mission_recap",
+    name: "Mission Trip Recap",
+    desc: "Mission/outreach highlights → impact stories + photos + call to support",
+    category: "ministry",
+    icon: "🌍",
+    defaults: {
+      type: "photo_montage",
+      clipCount: 1,
+      duration: 60,
+      captionStyle: "cross_bold",
+      platform: "16:9",
+      bgMusic: "inspirational",
+      transitions: "slide",
+    },
+    fields: [
+      { key: "photos", label: "Mission Photos (upload or URLs)", type: "textarea" },
+      { key: "missionLocation", label: "Location", type: "text", placeholder: "Guatemala" },
+      { key: "impactStats", label: "Impact Numbers", type: "text", placeholder: "200 fed, 50 saved" },
+    ],
+  },
+
+  // 12. Church Event Promo
+  {
+    id: "event_promo",
+    name: "Church Event Promo",
+    desc: "Upcoming event announcement → date, time, location, registration link",
+    category: "ministry",
+    icon: "📅",
+    defaults: {
+      type: "event_promo",
+      clipCount: 1,
+      duration: 15,
+      captionStyle: "cross_bold",
+      platform: "1:1",
+      bgVideo: "church_exterior",
+      textAnimation: "zoom",
+    },
+    fields: [
+      { key: "eventName", label: "Event Name", type: "text", placeholder: "Easter Sunrise Service" },
+      { key: "eventDate", label: "Date & Time", type: "text", placeholder: "Sunday, April 20 @ 6:00 AM" },
+      { key: "location", label: "Location", type: "text", placeholder: "Main Sanctuary" },
+      { key: "registerUrl", label: "Registration URL", type: "text" },
+    ],
+  },
+
+  // 13. Pastor's Weekly Message
+  {
+    id: "pastor_weekly",
+    name: "Pastor's Weekly Word",
+    desc: "Short pastor greeting/encouragement → personal, conversational, builds trust",
+    category: "ministry",
+    icon: "👔",
+    defaults: {
+      type: "pastor_message",
+      clipCount: 1,
+      minDuration: 30,
+      maxDuration: 90,
+      captionStyle: "minimal",
+      platform: "9:16",
+      faceTracking: true,
+      bgMusic: "soft_ambient",
+    },
+    fields: [
+      { key: "url", label: "Pastor Video URL", type: "text" },
+      { key: "pastor", label: "Pastor Name", type: "text" },
+      { key: "messageTheme", label: "Message Theme", type: "text", placeholder: "Hope in Hard Times" },
+    ],
+  },
+
+  // 14. Prophetic Word / Vision
+  {
+    id: "prophetic_word",
+    name: "Prophetic Word",
+    desc: "Prophetic message → reverent, powerful, scripture-backed",
+    category: "ministry",
+    icon: "⚡",
+    defaults: {
+      type: "prophetic",
+      clipCount: 1,
+      minDuration: 45,
+      maxDuration: 120,
+      captionStyle: "fire_revival",
+      platform: "9:16",
+      scriptureOverlay: true,
+      bgMusic: "ambient",
+      emotionDetection: true,
+    },
+    fields: [
+      { key: "url", label: "Message Video URL", type: "text" },
+      { key: "prophet", label: "Speaker Name", type: "text" },
+      { key: "scripture", label: "Supporting Verses", type: "text" },
+    ],
+  },
+
+  // 15. Christmas/Easter Special
+  {
+    id: "holiday_special",
+    name: "Christmas/Easter Service",
+    desc: "Holiday service highlights → celebration, invitation, share-worthy",
+    category: "ministry",
+    icon: "🎄",
+    defaults: {
+      type: "sermon_clip",
+      clipCount: 5,
+      minDuration: 20,
+      maxDuration: 60,
+      captionStyle: "holy_glow",
+      platform: "9:16",
+      bgMusic: "worship",
+      transitions: "crossfade",
+      quality: "high",
+    },
+    fields: [
+      { key: "url", label: "Service Video URL", type: "text" },
+      { key: "holiday", label: "Holiday", type: "select", options: [
+        { value: "christmas", label: "Christmas" },
+        { value: "easter", label: "Easter" },
+        { value: "pentecost", label: "Pentecost" },
+        { value: "good_friday", label: "Good Friday" },
+      ]},
+      { key: "pastor", label: "Pastor Name", type: "text" },
+    ],
+  },
+];
+
+// Merge Christian templates into main TEMPLATES array
+TEMPLATES.push(...CHRISTIAN_TEMPLATES);

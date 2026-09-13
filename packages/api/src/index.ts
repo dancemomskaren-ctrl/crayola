@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import {
   db,
+  client,
   project,
   render,
   asset,
@@ -20,22 +21,200 @@ import {
   unlinkSync,
   statSync,
   renameSync,
+  writeFileSync,
 } from "fs";
 
 const app = new Hono();
 app.use("/*", cors());
 
+// ─── API Key Auth (opt-in) ───
+// Off by default so a solo/localhost setup keeps working with zero
+// config. Set CRAYO_API_KEY in the environment to require every request
+// to send `Authorization: Bearer <key>` — do this before letting anyone
+// else (a VA, editor, or a machine other than your own laptop) reach
+// this server. /api/health is always open so uptime checks don't need
+// the key.
+const API_KEY = process.env.CRAYO_API_KEY;
+if (API_KEY) {
+  const { bearerAuth } = await import("hono/bearer-auth");
+  app.use("/api/*", async (c, next) => {
+    if (c.req.path === "/api/health") return next();
+    return bearerAuth({ token: API_KEY })(c, next);
+  });
+  console.log("CRAYO_API_KEY is set — all /api/* routes require Bearer auth (except /api/health).");
+} else {
+  console.log("CRAYO_API_KEY not set — API is open, no auth required. Set it before exposing this server beyond your own machine.");
+}
+
 const ROOT = join(import.meta.dir, "../../..");
 const OUTPUT_DIR = join(ROOT, "data/renders");
 const ASSETS_DIR = join(ROOT, "assets");
+const UPLOADS_DIR = join(ROOT, "data/uploads");
+const DELIVERY_DIR = join(ROOT, "data/delivery");
 if (!existsSync(OUTPUT_DIR)) mkdirSync(OUTPUT_DIR, { recursive: true });
+if (!existsSync(UPLOADS_DIR)) mkdirSync(UPLOADS_DIR, { recursive: true });
+if (!existsSync(DELIVERY_DIR)) mkdirSync(DELIVERY_DIR, { recursive: true });
+
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB — covers a full-length standup special/sermon/podcast at decent bitrate
 
 app.get("/api/health", (c) => c.json({ ok: true }));
+
+// ─── Upload: local mp4 → usable file path for auto-clip ───
+
+app.post("/api/upload", async (c) => {
+  const body = await c.req.parseBody();
+  const file = body["file"];
+  if (!file || !(file instanceof File)) {
+    return c.json({ error: "file is required (multipart form field 'file')" }, 400);
+  }
+  if (!file.type.startsWith("video/") && !file.name.toLowerCase().endsWith(".mp4")) {
+    return c.json({ error: "only video files (.mp4) are accepted" }, 400);
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return c.json(
+      { error: `file too large (${(file.size / 1e9).toFixed(2)}GB, max 2GB)` },
+      400,
+    );
+  }
+
+  const id = randomUUID();
+  const outPath = join(UPLOADS_DIR, `${id}.mp4`);
+  await Bun.write(outPath, file);
+
+  return c.json({ id, path: outPath, size: file.size, name: file.name });
+});
+
+// ─── Clients ───
+// A "client" is who a project's work is for (e.g. a specific church).
+// clientId on a project is optional — internal/test projects can have
+// none. This is intentionally simple: no auth-scoping per client here,
+// just a tag for organizing and filtering your own work.
+
+app.get("/api/clients", async (c) => {
+  const rows = db.select().from(client).all();
+  return c.json(rows);
+});
+
+app.post("/api/clients", async (c) => {
+  const body = await c.req.json();
+  if (!body.name || typeof body.name !== "string") {
+    return c.json({ error: "name is required" }, 400);
+  }
+  const id = randomUUID();
+  db.insert(client)
+    .values({
+      id,
+      name: body.name,
+      notes: body.notes ?? null,
+      createdAt: new Date(),
+    })
+    .run();
+  return c.json({ id });
+});
+
+app.get("/api/clients/:id", async (c) => {
+  const row = db
+    .select()
+    .from(client)
+    .where(eq(client.id, c.req.param("id")))
+    .get();
+  if (!row) return c.json({ error: "not found" }, 404);
+  return c.json(row);
+});
+
+app.delete("/api/clients/:id", async (c) => {
+  const id = c.req.param("id");
+  const row = db.select().from(client).where(eq(client.id, id)).get();
+  if (!row) return c.json({ error: "not found" }, 404);
+  // Unassign this client from any projects rather than deleting their
+  // history — losing render/project records when a client relationship
+  // ends is more destructive than anyone asked for.
+  db.update(project)
+    .set({ clientId: null })
+    .where(eq(project.clientId, id))
+    .run();
+  db.delete(client).where(eq(client.id, id)).run();
+  return c.json({ ok: true });
+});
+
+// ─── Delivery ───
+// "Deliver" = copy all undelivered finished renders for a client into
+// `data/delivery/<client-name>/<timestamp>/`, then mark them delivered
+// so they don't ship twice. Use this when a batch of clips is done and
+// ready for the client to review or for you to upload to their Drive.
+
+app.post("/api/deliver/:clientId", async (c) => {
+  const clientId = c.req.param("clientId");
+  const clientRow = db
+    .select()
+    .from(client)
+    .where(eq(client.id, clientId))
+    .get();
+  if (!clientRow) return c.json({ error: "client not found" }, 404);
+
+  // Find all done renders for this client that haven't been delivered yet
+  const projects = db
+    .select()
+    .from(project)
+    .where(eq(project.clientId, clientId))
+    .all();
+  if (projects.length === 0) {
+    return c.json({ delivered: 0, message: "No projects for this client" });
+  }
+  const projectIds = projects.map((p) => p.id);
+
+  const renders = db
+    .select()
+    .from(render)
+    .where(eq(render.status, "done"))
+    .all()
+    .filter((r) => projectIds.includes(r.projectId) && !r.deliveredAt);
+
+  if (renders.length === 0) {
+    return c.json({
+      delivered: 0,
+      message: "No undelivered renders for this client",
+    });
+  }
+
+  // Create a timestamped delivery folder for this batch
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const clientSlug = clientRow.name.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+  const deliveryFolder = join(DELIVERY_DIR, clientSlug, timestamp);
+  mkdirSync(deliveryFolder, { recursive: true });
+
+  const delivered: string[] = [];
+  for (const r of renders) {
+    if (!r.outputPath || !existsSync(r.outputPath)) continue;
+    const filename = r.outputPath.split("/").pop() || `${r.id}.mp4`;
+    const destPath = join(deliveryFolder, filename);
+    try {
+      const { copyFileSync } = await import("fs");
+      copyFileSync(r.outputPath, destPath);
+      db.update(render)
+        .set({ deliveredAt: new Date() })
+        .where(eq(render.id, r.id))
+        .run();
+      delivered.push(filename);
+    } catch (err: any) {
+      console.error(`Failed to deliver ${r.id}:`, err.message);
+    }
+  }
+
+  return c.json({
+    delivered: delivered.length,
+    folder: deliveryFolder,
+    files: delivered,
+  });
+});
 
 // ─── Projects ───
 
 app.get("/api/projects", async (c) => {
-  const rows = db.select().from(project).all();
+  const clientId = c.req.query("clientId");
+  const rows = clientId
+    ? db.select().from(project).where(eq(project.clientId, clientId)).all()
+    : db.select().from(project).all();
   return c.json(rows);
 });
 
@@ -65,6 +244,18 @@ app.post("/api/projects", async (c) => {
       400,
     );
   }
+  // clientId is optional. When provided, it must reference a real client
+  // so projects can't silently point at a typo'd/nonexistent client.
+  if (body.clientId) {
+    const clientRow = db
+      .select()
+      .from(client)
+      .where(eq(client.id, body.clientId))
+      .get();
+    if (!clientRow) {
+      return c.json({ error: "clientId does not match an existing client" }, 400);
+    }
+  }
   const id = randomUUID();
   db.insert(project)
     .values({
@@ -73,6 +264,7 @@ app.post("/api/projects", async (c) => {
       type: body.type,
       script: body.script,
       url: body.url,
+      clientId: body.clientId ?? null,
       createdAt: new Date(),
     })
     .run();
@@ -252,6 +444,9 @@ app.post("/api/generate-script", async (c) => {
   if (!body.topic || typeof body.topic !== "string") {
     return c.json({ error: "topic is required" }, 400);
   }
+  // ragebaitHook is opt-in only: must be explicitly `true` in the request
+  // body. Any other value (missing, false, truthy string, etc.) is off.
+  const ragebaitHook = body.ragebaitHook === true;
   try {
     const { generateScript } = await import("@crayo/ai");
     const script = await generateScript({
@@ -259,6 +454,7 @@ app.post("/api/generate-script", async (c) => {
       style: body.style,
       duration: body.duration,
       platform: body.platform,
+      ragebaitHook,
     });
     return c.json(script);
   } catch (err: any) {
@@ -551,62 +747,333 @@ app.post("/api/download", async (c) => {
 
 app.post("/api/auto-clip", async (c) => {
   const body = await c.req.json();
-  if (!body.url || typeof body.url !== "string") {
-    return c.json({ error: "url is required" }, 400);
+  const hasUrl = body.url && typeof body.url === "string";
+  const hasLocalFile =
+    body.localFilePath && typeof body.localFilePath === "string";
+  if (!hasUrl && !hasLocalFile) {
+    return c.json(
+      { error: "either url or localFilePath is required (localFilePath comes from /api/upload)" },
+      400,
+    );
   }
 
-  const { autoClip } = await import("@crayo/ai");
+  const { autoClip, detectFaces } = await import("@crayo/ai");
+  const { ASPECTS, QUALITY, ffmpeg, writeASS } = await import(
+    "@crayo/core"
+  );
 
   try {
     const result = await autoClip({
-      url: body.url,
+      url: hasUrl ? body.url : undefined,
+      localFilePath: hasLocalFile ? body.localFilePath : undefined,
       clipCount: Number(body.clipCount ?? 5),
       minDuration: Number(body.minDuration ?? 15),
       maxDuration: Number(body.maxDuration ?? 60),
       language: body.language ?? "en",
     });
 
-    // Create projects + renders for each clip
+    if (result.clips.length === 0) {
+      return c.json({ error: "No highlights detected" }, 400);
+    }
+
+    // Resolve settings
+    const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
+    const platformKey = String(body.platform ?? "9:16");
+    const platform = validPlatforms.includes(platformKey as any)
+      ? (platformKey as keyof typeof ASPECTS)
+      : "9:16";
+    const aspect = ASPECTS[platform];
+
+    const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
+    const qualityKey = String(body.quality ?? "standard");
+    const quality = validQualities.includes(qualityKey as any)
+      ? (qualityKey as keyof typeof QUALITY)
+      : "standard";
+    const qual = QUALITY[quality];
+
+    const captionStyleName = String(body.captionStyle ?? "bold_pop");
+    // premium = 60fps motion interpolation via FFmpeg minterpolate.
+    // Off by default: it multiplies render time.
+    const usePremium = body.premium === true;
+    const bgClips = listStockClips();
+
+    const ASS_STYLES = new Set([
+      "typewriter",
+      "bounce",
+      "shake",
+      "zoom",
+      "colorful",
+      "word_by_word",
+      "glow",
+      "neon",
+    ]);
+
+    // Render each clip with captions, title, smart zoom
     const projects: any[] = [];
-    for (const clip of result.clips) {
+    for (let i = 0; i < result.clips.length; i++) {
+      const clip = result.clips[i];
       const projId = randomUUID();
       const renderId = randomUUID();
+      const clipDur = (clip.endMs - clip.startMs) / 1000;
+      const clipStartSec = clip.startMs / 1000;
 
-      db.insert(project)
-        .values({
-          id: projId,
-          name: `Auto-clip: ${clip.text.slice(0, 40)}...`,
-          type: "story",
-          script: clip.text,
-          createdAt: new Date(),
-        })
-        .run();
+      try {
+        const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
+        const tempFiles: string[] = [];
 
-      db.insert(render)
-        .values({
-          id: renderId,
+        // Extract clip segment from source
+        const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
+        tempFiles.push(segPath);
+        await ffmpeg.run([
+          "-y",
+          "-ss",
+          String(clipStartSec),
+          "-i",
+          result.sourcePath,
+          "-t",
+          String((clip.endMs - clip.startMs) / 1000),
+          "-c",
+          "copy",
+          segPath,
+        ]);
+
+        // Reformat to target aspect ratio (e.g. 9:16 for TikTok)
+        const fmtPath = join(OUTPUT_DIR, `${renderId}-fmt.mp4`);
+        tempFiles.push(fmtPath);
+        await ffmpeg.run([
+          "-y",
+          "-i",
+          segPath,
+          "-vf",
+          `scale=${aspect.width}:${aspect.height}:force_original_aspect_ratio=decrease,pad=${aspect.width}:${aspect.height}:(ow-iw)/2:(oh-ih)/2:black`,
+          "-c:v",
+          "libx264",
+          "-preset",
+          qual.preset,
+          "-crf",
+          String(qual.crf),
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          fmtPath,
+        ]);
+
+        // Get captions for this clip
+        const clipCaptions = clip.captions || [];
+
+        // Detect faces for smart zoom
+        let faceData: any = null;
+        if (body.smartZoom !== false) {
+          try {
+            const faceOutPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
+            tempFiles.push(faceOutPath);
+            faceData = await detectFaces({
+              inputPath: segPath,
+              outputPath: faceOutPath,
+              sampleFps: 2,
+            });
+          } catch (e) {
+            console.warn("Face detection failed:", e);
+          }
+        }
+
+        // Build background
+        let renderPath = fmtPath;
+        if (bgClips.length > 0 && body.bgVideo !== false) {
+          const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
+          tempFiles.push(bgPath);
+          const bg = bgClips[i % bgClips.length];
+          await ffmpeg.trim({ input: bg, end: clipDur + 2, output: bgPath });
+          const compositedPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
+          tempFiles.push(compositedPath);
+          await ffmpeg.composeSplitScreen(fmtPath, bg, compositedPath, {
+            bgPosition: body.bgPosition ?? "right",
+          });
+          renderPath = compositedPath;
+        }
+
+        // Generate title overlay (clickbait style)
+        const titleText = clip.suggestedTitle || clip.text.slice(0, 50) + "...";
+
+        // Route caption generation based on style
+        let vf = ""; // video filter string
+        
+        if (captionStyleName === "none") {
+          // No captions, just title
+          const titleY = Math.floor(aspect.height * 0.12);
+          vf = `drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
+        } else if (captionStyleName.startsWith("viral_")) {
+          // Viral ASS captions (MrBeast, Hormozi, etc.)
+          const { generateViralASS } = await import("@crayo/core");
+          const viralStyleId = captionStyleName.replace("viral_", ""); // e.g. "mrbeast"
+          
+          const assPath = join(OUTPUT_DIR, `${renderId}-viral.ass`);
+          tempFiles.push(assPath);
+          
+          const assContent = generateViralASS(
+            clipCaptions.map(c => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })),
+            viralStyleId,
+            aspect.width,
+            aspect.height,
+            10, // position from bottom (%)
+          );
+          
+          writeFileSync(assPath, assContent);
+          
+          // Title + viral ASS captions
+          const titleY = Math.floor(aspect.height * 0.12);
+          vf = `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
+        } else if (captionStyleName.startsWith("scattered_")) {
+          // Scattered word captions (aesthetic edit style)
+          const { buildScatteredWordFilterComplex } = await import("@crayo/core");
+          const scatteredStyleId = captionStyleName.replace("scattered_", ""); // e.g. "clean", "neon"
+          
+          const scatteredFilter = buildScatteredWordFilterComplex({
+            words: clipCaptions.map(c => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })),
+            videoWidth: aspect.width,
+            videoHeight: aspect.height,
+            style: scatteredStyleId as any,
+            minFontSize: 60,
+            maxFontSize: 100,
+            safeMargin: 50,
+          });
+          
+          // Scattered words (no title needed, words are the aesthetic)
+          vf = scatteredFilter;
+        } else {
+          // Traditional ASS styles (bold_pop, typewriter, bounce, etc.)
+          const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
+          tempFiles.push(assPath);
+          writeASS(
+            clipCaptions.map((c) => ({
+              text: c.text,
+              startMs: c.startMs,
+              endMs: c.endMs,
+            })),
+            captionStyleName,
+            assPath,
+            aspect.width,
+            aspect.height,
+          );
+
+          // Title + traditional ASS captions
+          const titleY = Math.floor(aspect.height * 0.12);
+          vf = `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
+        }
+
+        // Render with chosen caption style.
+        // Premium mode appends FFmpeg's minterpolate filter, which
+        // synthesises in-between frames for 60fps motion. It is slow
+        // (roughly 3-5x a normal render) so it stays opt-in per request.
+        const vfChain = usePremium
+          ? `${vf},minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1`
+          : vf;
+
+        await ffmpeg.run([
+          "-y",
+          "-i",
+          renderPath,
+          "-vf",
+          vfChain,
+          "-c:v",
+          "libx264",
+          "-preset",
+          qual.preset,
+          "-crf",
+          String(qual.crf),
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          "-shortest",
+          outPath,
+        ]);
+
+        db.insert(project)
+          .values({
+            id: projId,
+            name: `Auto-clip: ${clip.text.slice(0, 40)}...`,
+            type: "story",
+            script: clip.text,
+            createdAt: new Date(),
+          })
+          .run();
+
+        db.insert(render)
+          .values({
+            id: renderId,
+            projectId: projId,
+            status: "done",
+            outputPath: outPath,
+            settings: JSON.stringify({
+              autoClip: true,
+              startMs: clip.startMs,
+              endMs: clip.endMs,
+              score: clip.score,
+              sourceUrl: hasUrl ? body.url : undefined,
+              sourceUpload: hasLocalFile ? body.localFilePath : undefined,
+            }),
+            createdAt: new Date(),
+          })
+          .run();
+
+        projects.push({
           projectId: projId,
-          status: "done",
-          outputPath: clip.path,
-          settings: JSON.stringify({
-            autoClip: true,
-            startMs: clip.startMs,
-            endMs: clip.endMs,
-            score: clip.score,
-            sourceUrl: body.url,
-          }),
-          createdAt: new Date(),
-        })
-        .run();
+          renderId,
+          text: clip.text,
+          startMs: clip.startMs,
+          endMs: clip.endMs,
+          score: clip.score,
+        });
 
-      projects.push({
-        projectId: projId,
-        renderId,
-        text: clip.text,
-        startMs: clip.startMs,
-        endMs: clip.endMs,
-        score: clip.score,
-      });
+        // Cleanup temp files
+        for (const f of tempFiles) {
+          try {
+            unlinkSync(f);
+          } catch {}
+        }
+      } catch (err: any) {
+        console.error(`Failed to render clip ${i}:`, err.message);
+        // Still create a project record with the raw clip as fallback
+        const projId = randomUUID();
+        const renderId = randomUUID();
+        db.insert(project)
+          .values({
+            id: projId,
+            name: `Auto-clip: ${clip.text.slice(0, 40)}...`,
+            type: "story",
+            script: clip.text,
+            createdAt: new Date(),
+          })
+          .run();
+        db.insert(render)
+          .values({
+            id: renderId,
+            projectId: projId,
+            status: "done",
+            outputPath: clip.path,
+            settings: JSON.stringify({
+              autoClip: true,
+              startMs: clip.startMs,
+              endMs: clip.endMs,
+              score: clip.score,
+              sourceUrl: hasUrl ? body.url : undefined,
+              sourceUpload: hasLocalFile ? body.localFilePath : undefined,
+            }),
+            createdAt: new Date(),
+          })
+          .run();
+
+        projects.push({
+          projectId: projId,
+          renderId,
+          text: clip.text,
+          startMs: clip.startMs,
+          endMs: clip.endMs,
+          score: clip.score,
+        });
+      }
     }
 
     return c.json({ clips: projects });
@@ -1276,6 +1743,798 @@ app.post("/api/podcast-clip", async (c) => {
     try {
       unlinkSync(audioPath);
     } catch {}
+
+    return c.json({ clips: projects });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Standup Comedy: YouTube special / local mp4 → comedy-optimized highlight clips ───
+// This is like auto-clip but with comedy-specific post-processing:
+//   • Extends clip end to capture audience laughter after each punchline
+//   • Smart zoom on comedians' faces (zoom cuts for reaction shots)
+//   • Punch-up title + word-by-word captions (tiktok-style "title + captions")
+//   • Comedy-specific caption style defaults (bold pop, lower-third placement)
+
+// ─── Music Edit: Beat-Synced Aesthetic Edits ───
+
+app.post("/api/music-edit", async (c) => {
+  const body = await c.req.json();
+  
+  // Validate inputs
+  if (!body.audioFile || typeof body.audioFile !== "string") {
+    return c.json({ error: "audioFile is required" }, 400);
+  }
+  if (!body.sourceVideos || !Array.isArray(body.sourceVideos) || body.sourceVideos.length === 0) {
+    return c.json({ error: "sourceVideos array is required (min 1 video)" }, 400);
+  }
+
+  const renderId = randomUUID();
+  const projId = randomUUID();
+  const tempFiles: string[] = [];
+
+  try {
+    const { ASPECTS, QUALITY, ffmpeg, buildScatteredWordFilterComplex, generateViralASS } = await import("@crayo/core");
+    const { detectBeats, snapToBeat, getBeatsInRange, calculateCutDensity } = await import("@crayo/ai");
+
+    const aspect = ASPECTS[body.platform || "9:16"];
+    const qual = QUALITY[body.quality || "high"];
+    const cutDensity = body.cutDensity || "auto";
+    const minClipLength = Number(body.minClipLength || 0.5);
+    const maxClipLength = Number(body.maxClipLength || 4);
+    const transitionStyle = body.transitionStyle || "cut";
+    const captionStyle = body.captionStyle || "none";
+
+    // Step 1: Detect beats in music track
+    console.log("[music-edit] Detecting beats...");
+    const beatGrid = await detectBeats({
+      audioPath: body.audioFile,
+      minBPM: 60,
+      maxBPM: 200,
+      threshold: 0.6,
+    });
+
+    console.log(`[music-edit] Found ${beatGrid.beats.length} beats, BPM: ${beatGrid.bpm}`);
+
+    // Step 1.5: Analyze source videos (scene-aware selection)
+    console.log("[music-edit] Analyzing source videos...");
+    const { analyzeAllVideos, findBestSceneForSection } = await import("@crayo/ai");
+    const { analyzeStemEnergy, matchCameraToStem } = await import("@crayo/ai");
+    
+    const sceneMap = await analyzeAllVideos(
+      body.sourceVideos,
+      5, // sample keyframe every 5 seconds
+    );
+    
+    // Flatten all scenes into a single array
+    const allScenes: Array<any> = [];
+    for (const [videoPath, scenes] of sceneMap.entries()) {
+      allScenes.push(...scenes);
+    }
+    
+    console.log(`[music-edit] Analyzed ${allScenes.length} total scenes`);
+
+    // Step 1.75: Analyze audio stems for camera switching
+    console.log("[music-edit] Analyzing audio stems for camera switching...");
+    const stemAnalysis = await analyzeStemEnergy(body.audioFile);
+    console.log(`[music-edit] Stem analysis complete — vocals: ${stemAnalysis.vocals.energy.toFixed(2)}, drums: ${stemAnalysis.drums.energy.toFixed(2)}, bass: ${stemAnalysis.bass.energy.toFixed(2)}`);
+
+    // Step 2: Generate cut timeline (scene-aware)
+    console.log("[music-edit] Generating cut timeline...");
+    const timeline: Array<{
+      sourceVideo: string;
+      sourceStartMs: number;
+      durationMs: number;
+      beatTimestamp: number;
+    }> = [];
+
+    let currentTime = 0;
+    const usedScenes = new Set<number>();
+
+    for (const section of beatGrid.sections) {
+      const sectionBeats = getBeatsInRange(beatGrid, section.startMs, section.endMs);
+      
+      // Determine cut frequency based on energy
+      let targetCutDensity: number;
+      if (cutDensity === "auto") {
+        targetCutDensity = calculateCutDensity(section.energy);
+      } else if (cutDensity === "low") {
+        targetCutDensity = 0.5;
+      } else if (cutDensity === "medium") {
+        targetCutDensity = 1.0;
+      } else {
+        targetCutDensity = 2.0; // high
+      }
+
+      // Generate cuts for this section
+      const beatInterval = 1 / targetCutDensity; // seconds between cuts
+      let lastCutTime = section.startMs / 1000;
+
+      for (const beat of sectionBeats) {
+        const beatSec = beat.timeMs / 1000;
+        
+        // Only cut if enough time has passed
+        if (beatSec - lastCutTime < beatInterval) continue;
+
+        // Calculate clip duration (time to next cut or max length)
+        let clipDuration = beatInterval;
+        clipDuration = Math.max(minClipLength, Math.min(maxClipLength, clipDuration));
+
+        // SCENE-AWARE SELECTION: Find best matching scene for this section
+        // Use stem analysis to determine desired camera angle
+        const stemAtBeat = stemAnalysis.timeline.find(
+          (s: any) => beat.timeMs >= s.startMs && beat.timeMs < s.endMs,
+        );
+        const dominantStem = stemAtBeat?.dominantStem || "other";
+        const desiredCamera = matchCameraToStem(dominantStem);
+
+        const bestScene = findBestSceneForSection(
+          allScenes,
+          section.energy,
+          section.type === "chorus" ? "intense" : section.type === "intro" ? "calm" : undefined,
+          usedScenes,
+          desiredCamera, // NEW: pass desired camera angle
+        );
+
+        let sourceVideo: string;
+        let sourceStartMs: number;
+
+        if (bestScene) {
+          // Use the best matching scene
+          sourceVideo = bestScene.sourceVideo;
+          sourceStartMs = bestScene.startMs;
+          
+          // Mark this scene as used
+          const sceneIdx = allScenes.indexOf(bestScene);
+          if (sceneIdx >= 0) usedScenes.add(sceneIdx);
+        } else {
+          // Fallback: round-robin if no good match found
+          sourceVideo = body.sourceVideos[timeline.length % body.sourceVideos.length];
+          sourceStartMs = Math.random() * 30000;
+        }
+
+        timeline.push({
+          sourceVideo,
+          sourceStartMs,
+          durationMs: clipDuration * 1000,
+          beatTimestamp: beat.timeMs,
+        });
+
+        currentTime += clipDuration * 1000;
+        lastCutTime = beatSec;
+      }
+    }
+
+    console.log(`[music-edit] Generated ${timeline.length} clips`);
+
+    // Step 3: Extract and render segments
+    console.log("[music-edit] Extracting segments...");
+    const segmentPaths: string[] = [];
+
+    for (let i = 0; i < timeline.length; i++) {
+      const seg = timeline[i];
+      const segPath = join(OUTPUT_DIR, `${renderId}-seg-${i}.mp4`);
+      tempFiles.push(segPath);
+
+      const startSec = seg.sourceStartMs / 1000;
+      const durSec = seg.durationMs / 1000;
+
+      // Extract segment from source video with aspect ratio conversion
+      await ffmpeg.run([
+        "-y",
+        "-ss", String(startSec),
+        "-i", seg.sourceVideo,
+        "-t", String(durSec),
+        "-vf", `scale=${aspect.width}:${aspect.height}:force_original_aspect_ratio=decrease,pad=${aspect.width}:${aspect.height}:(ow-iw)/2:(oh-ih)/2:black`,
+        "-c:v", "libx264",
+        "-preset", qual.preset,
+        "-crf", String(qual.crf),
+        "-c:a", "aac",
+        "-b:a", "128k",
+        segPath,
+      ]);
+
+      segmentPaths.push(segPath);
+    }
+
+    // Step 4: Concatenate segments with transitions
+    console.log("[music-edit] Concatenating segments with transitions...");
+    const concatPath = join(OUTPUT_DIR, `${renderId}-concat.mp4`);
+    tempFiles.push(concatPath);
+
+    const { concatWithTransitions, selectTransitionForEnergy, TRANSITION_PRESETS } = await import("@crayo/ai");
+
+    // Determine transition config
+    let transitionConfig;
+    if (transitionStyle === "cut") {
+      transitionConfig = TRANSITION_PRESETS.cut;
+    } else {
+      // Use energy-aware transition duration (faster on drops, slower on verses)
+      // Use the overall song energy to pick a base, but individual transitions
+      // will be adjusted per-section
+      const avgEnergy = beatGrid.sections.length > 0
+        ? (beatGrid.sections.filter((s: any) => s.energy === "high").length / beatGrid.sections.length > 0.5 ? "high" : "medium")
+        : "medium";
+      transitionConfig = selectTransitionForEnergy(avgEnergy as any, transitionStyle as any);
+    }
+
+    await concatWithTransitions(
+      segmentPaths,
+      concatPath,
+      transitionConfig,
+      ffmpeg.run.bind(ffmpeg),
+    );
+
+    // Step 5: Add music track
+    console.log("[music-edit] Adding music track...");
+    const withMusicPath = join(OUTPUT_DIR, `${renderId}-with-music.mp4`);
+    tempFiles.push(withMusicPath);
+
+    await ffmpeg.run([
+      "-y",
+      "-i", concatPath,
+      "-i", body.audioFile,
+      "-map", "0:v", // video from concat
+      "-map", "1:a", // audio from music
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-b:a", "192k",
+      "-shortest", // stop when shortest input ends
+      withMusicPath,
+    ]);
+
+    // Step 5.5: B-Roll Injection (if enabled)
+    let brollOutputPath = withMusicPath;
+    if (body.enableBroll && body.brollClips && body.brollClips.length > 0) {
+      console.log("[music-edit] Injecting B-roll...");
+      const { generateBRollEvents, buildBRollFilter, selectBRollBeats } = await import("@crayo/ai");
+
+      // Select which beats get B-roll (highest energy beats)
+      const brollBeats = selectBRollBeats(
+        beatGrid.beats,
+        body.brollRate ?? 0.2, // default 20% of beats get B-roll
+      );
+
+      // Generate B-roll events
+      const brollEvents = generateBRollEvents({
+        beatTimestamps: brollBeats,
+        brollClips: body.brollClips.map((p: string) => ({ path: p, durationMs: 5000 })),
+        injectionRate: 1.0, // we already filtered beats above
+        style: body.brollStyle ?? "flash",
+        maxDurationMs: 500,
+        minDurationMs: 100,
+      });
+
+      if (brollEvents.length > 0) {
+        console.log(`[music-edit] Injecting ${brollEvents.length} B-roll events...`);
+        
+        // Build B-roll filter (simple mode: flash/zoom effects on beats)
+        const brollFilter = buildBRollFilter(brollEvents, aspect.width, aspect.height);
+
+        if (brollFilter) {
+          const brollPath = join(OUTPUT_DIR, `${renderId}-broll.mp4`);
+          tempFiles.push(brollPath);
+
+          await ffmpeg.run([
+            "-y",
+            "-i", withMusicPath,
+            "-vf", brollFilter,
+            "-c:v", "libx264",
+            "-preset", qual.preset,
+            "-crf", String(qual.crf),
+            "-c:a", "copy",
+            brollPath,
+          ]);
+
+          brollOutputPath = brollPath;
+        }
+      }
+    }
+
+    // Step 6: Add captions (if requested)
+    const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
+    
+    if (captionStyle === "none") {
+      // No captions, just rename final file
+      if (brollOutputPath !== outPath) renameSync(brollOutputPath, outPath);
+    } else {
+      console.log("[music-edit] Adding captions...");
+      
+      // TODO: Add Whisper transcription for scattered captions
+      // For now, skip captions if not implemented yet
+      
+      // If viral or scattered style, would generate here
+      // For now, just copy the file
+      if (brollOutputPath !== outPath) renameSync(brollOutputPath, outPath);
+    }
+
+    // Save to database
+    db.insert(project)
+      .values({
+        id: projId,
+        name: `Music Edit: ${beatGrid.bpm} BPM`,
+        type: "story",
+        script: `Beat-synced edit with ${timeline.length} clips`,
+        createdAt: new Date(),
+      })
+      .run();
+
+    db.insert(render)
+      .values({
+        id: renderId,
+        projectId: projId,
+        status: "done",
+        outputPath: outPath,
+        settings: JSON.stringify({
+          musicEdit: true,
+          bpm: beatGrid.bpm,
+          clipCount: timeline.length,
+          cutDensity,
+          sections: beatGrid.sections,
+        }),
+        createdAt: new Date(),
+      })
+      .run();
+
+    // Cleanup temp files
+    for (const f of tempFiles) {
+      try {
+        unlinkSync(f);
+      } catch {}
+    }
+
+    return c.json({
+      success: true,
+      projectId: projId,
+      renderId,
+      outputPath: `/renders/${renderId}.mp4`,
+      metadata: {
+        bpm: beatGrid.bpm,
+        sections: beatGrid.sections,
+        totalClips: timeline.length,
+        durationMs: timeline.reduce((sum, t) => sum + t.durationMs, 0),
+      },
+    });
+
+  } catch (err: any) {
+    console.error("[music-edit] Error:", err);
+    
+    // Cleanup on error
+    for (const f of tempFiles) {
+      try {
+        unlinkSync(f);
+      } catch {}
+    }
+    
+    return c.json({ error: err.message, stack: err.stack }, 500);
+  }
+});
+
+app.post("/api/standup-clip", async (c) => {
+  const body = await c.req.json();
+  const hasUrl = body.url && typeof body.url === "string";
+  const hasLocalFile =
+    body.localFilePath && typeof body.localFilePath === "string";
+  if (!hasUrl && !hasLocalFile) {
+    return c.json(
+      { error: "either url or localFilePath is required" },
+      400,
+    );
+  }
+
+  const { autoClip, detectFaces } = await import("@crayo/ai");
+  const { ASPECTS, QUALITY, ffmpeg, writeASS } = await import(
+    "@crayo/core"
+  );
+
+  try {
+    const result = await autoClip({
+      url: hasUrl ? body.url : undefined,
+      localFilePath: hasLocalFile ? body.localFilePath : undefined,
+      clipCount: Number(body.clipCount ?? 5),
+      minDuration: Number(body.minDuration ?? 30),
+      maxDuration: Number(body.maxDuration ?? 90),
+      language: body.language ?? "en",
+    });
+
+    if (result.clips.length === 0) {
+      return c.json({ error: "No highlights detected" }, 400);
+    }
+
+    // Resolve settings
+    const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
+    const platformKey = String(body.platform ?? "9:16");
+    const platform = validPlatforms.includes(platformKey as any)
+      ? (platformKey as keyof typeof ASPECTS)
+      : "9:16";
+    const aspect = ASPECTS[platform];
+
+    const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
+    const qualityKey = String(body.quality ?? "standard");
+    const quality = validQualities.includes(qualityKey as any)
+      ? (qualityKey as keyof typeof QUALITY)
+      : "standard";
+    const qual = QUALITY[quality];
+
+    const captionStyleName = String(body.captionStyle ?? "bold_pop");
+    const titleStyle = String(body.titleStyle ?? "bold_pop");
+    const hookIntro = String(body.hookIntro ?? "Wait... until you hear this");
+    const extendLaughter = body.extendForLaughter !== false;
+    const zoomOnLaughter = body.zoomOnLaughter !== false;
+
+    const bgClips = listStockClips();
+
+    const projects: any[] = [];
+    for (let i = 0; i < result.clips.length; i++) {
+      const clip = result.clips[i];
+      const projId = randomUUID();
+      const renderId = randomUUID();
+      const clipDur = (clip.endMs - clip.startMs) / 1000;
+      const clipStartSec = clip.startMs / 1000;
+
+      try {
+        const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
+        const tempFiles: string[] = [];
+
+        // Extract clip segment from source
+        const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
+        tempFiles.push(segPath);
+        await ffmpeg.run([
+          "-y",
+          "-ss",
+          String(clipStartSec),
+          "-i",
+          result.sourcePath,
+          "-t",
+          String((clip.endMs - clip.startMs) / 1000),
+          "-c",
+          "copy",
+          segPath,
+        ]);
+
+        // Comedy tweak #1: extend for laughter via speech-gap detection
+        let actualEndMs = clip.endMs;
+        let actualEndSec = clipDur;
+        let actualDur = clipDur;
+        if (extendLaughter) {
+          // Find the next speech segment after this clip ends
+          const allCaps = result.allCaptions || [];
+          const nextSpeech = allCaps.find(
+            (cap: any) => cap.startMs > clip.endMs + 500,
+          );
+          const gapToNext = nextSpeech
+            ? nextSpeech.startMs - clip.endMs
+            : Infinity;
+
+          // Extend to capture audience laughter, but:
+          // - only up to 10s max (avoid dead air)
+          // - only if the gap is < 5s (crowd laughing, not end of show)
+          // - if next speech resumes quickly (gap < 2s) and the new
+          //   caption is a continuation of the same joke, merge it into
+          //   this clip (related jokes stay together)
+          let extension = 0;
+          if (gapToNext > 500 && gapToNext < 5000) {
+            // Audience pause (laughter) between punchline and next line
+            extension = Math.min(gapToNext, 10000);
+          } else if (gapToNext >= 0 && gapToNext < 2000) {
+            // Very short gap — likely a continuation of the same bit.
+            // Extend to the end of the next speech + its trailing gap.
+            let curEnd = nextSpeech.endMs;
+            let curCap = nextSpeech;
+            // Keep chaining subsequent sentences that follow with < 2s gaps
+            // (same joke/story thread)
+            while (curEnd < clip.endMs + 12000) {
+              const after = allCaps.find(
+                (cap: any) => cap.startMs > curEnd + 500,
+              );
+              if (!after) break;
+              const nextGap = after.startMs - curEnd;
+              if (nextGap > 2000) break; // new joke topic — stop
+              curEnd = after.endMs;
+              curCap = after;
+            }
+            extension = Math.min(curCap.endMs - clip.endMs, 10000);
+          }
+
+          if (extension > 500) {
+            actualEndMs = clip.endMs + extension;
+            const extDur = (actualEndMs - clip.startMs) / 1000;
+            // Re-extract with extended duration
+            await ffmpeg.run([
+              "-y",
+              "-ss",
+              String(clipStartSec),
+              "-i",
+              result.sourcePath,
+              "-t",
+              String(extDur),
+              "-c",
+              "copy",
+              segPath,
+            ]);
+            actualEndSec = extDur;
+            actualDur = extDur;
+          }
+        }
+
+        // Reformat to target aspect ratio (e.g. 9:16 for TikTok)
+        const fmtPath = join(OUTPUT_DIR, `${renderId}-fmt.mp4`);
+        tempFiles.push(fmtPath);
+        await ffmpeg.run([
+          "-y",
+          "-i",
+          segPath,
+          "-vf",
+          `scale=${aspect.width}:${aspect.height}:force_original_aspect_ratio=decrease,pad=${aspect.width}:${aspect.height}:(ow-iw)/2:(oh-ih)/2:black`,
+          "-c:v",
+          "libx264",
+          "-preset",
+          qual.preset,
+          "-crf",
+          String(qual.crf),
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          fmtPath,
+        ]);
+
+        // Detect faces for smart zoom
+        let faceData: any = null;
+        let faceKeyframes: any[] = [];
+        if (zoomOnLaughter) {
+          try {
+            const faceOutPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
+            tempFiles.push(faceOutPath);
+            faceData = await detectFaces({
+              inputPath: fmtPath,
+              outputPath: faceOutPath,
+              sampleFps: 3,
+            });
+            faceKeyframes = faceData?.keyframes || [];
+          } catch (e) {
+            console.warn("Face detection failed:", e);
+          }
+        }
+
+        // Build background
+        let renderPath = fmtPath;
+        if (bgClips.length > 0 && body.bgVideo !== false) {
+          const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
+          tempFiles.push(bgPath);
+          const bg = bgClips[i % bgClips.length];
+          await ffmpeg.trim({
+            input: bg,
+            end: actualDur + 2,
+            output: bgPath,
+          });
+          const compositedPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
+          tempFiles.push(compositedPath);
+          await ffmpeg.composeSplitScreen(fmtPath, bg, compositedPath, {
+            bgPosition: "right",
+          });
+          renderPath = compositedPath;
+        }
+
+        // Comedy tweaks #2 & #3: title overlay + captions + smart zoom
+        const titleText = clip.suggestedTitle || hookIntro;
+        const captionText = clip.captions || [];
+
+        if (faceKeyframes.length > 0 && zoomOnLaughter) {
+          // Smart zoom + captions + title
+          // Build captions ASS
+          const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
+          tempFiles.push(assPath);
+          writeASS(
+            captionText.map((c) => ({
+              text: c.text,
+              startMs: c.startMs,
+              endMs: c.endMs,
+            })),
+            captionStyleName,
+            assPath,
+            aspect.width,
+            aspect.height,
+          );
+
+          // Use smart zoom with face tracking then overlay captions + title
+          const zoomedPath = join(OUTPUT_DIR, `${renderId}-zoomed.mp4`);
+          tempFiles.push(zoomedPath);
+
+          const cropW = Math.round(aspect.width * 0.55);
+          const cropH = Math.round(aspect.height * 0.55);
+          const facePoints = faceKeyframes.map((kf: any) => {
+            const faceCx = kf.x + kf.w / 2;
+            const faceCy = kf.y + kf.h / 2;
+            return {
+              t: kf.t,
+              cx: Math.max(cropW / 2, Math.min(aspect.width - cropW / 2, faceCx * (aspect.width / faceData.width))),
+              cy: Math.max(cropH / 2, Math.min(aspect.height - cropH / 2, faceCy * (aspect.height / faceData.height))),
+            };
+          });
+
+          // Build zoom expressions
+          const buildExpr = (dim: "cx" | "cy", cropDim: number, srcDim: number) => {
+            const segs: { t0: number; t1: number; expr: string }[] = [];
+            for (let i = 0; i < facePoints.length - 1; i++) {
+              const t0 = facePoints[i].t;
+              const t1 = facePoints[i + 1].t;
+              const v0 = facePoints[i][dim] - cropDim / 2;
+              const v1 = facePoints[i + 1][dim] - cropDim / 2;
+              const dt = t1 - t0;
+              if (dt <= 0) continue;
+              const val = `clip(${v0.toFixed(1)}+(${(v1 - v0).toFixed(1)})*(t-${t0.toFixed(3)})/${dt.toFixed(3)},0,${(srcDim - cropDim).toFixed(1)})`;
+              segs.push({ t0, t1, expr: val });
+            }
+            if (segs.length === 0) return "0";
+            let expr = segs[segs.length - 1].expr;
+            for (let i = segs.length - 2; i >= 0; i--) {
+              expr = `if(gte(t,${segs[i].t0}),${segs[i].expr},${expr})`;
+            }
+            return expr;
+          };
+
+          const xExpr = buildExpr("cx", cropW, aspect.width);
+          const yExpr = buildExpr("cy", cropH, aspect.height);
+
+          await ffmpeg.run([
+            "-y",
+            "-i",
+            renderPath,
+            "-vf",
+            `crop=${cropW}:${cropH}:${xExpr}:${yExpr},scale=${aspect.width}:${aspect.height}`,
+            "-c:v",
+            "libx264",
+            "-preset",
+            qual.preset,
+            "-crf",
+            String(qual.crf),
+            "-c:a",
+            "copy",
+            zoomedPath,
+          ]);
+
+          // Apply captions + title on the zoomed video
+          const titleY = Math.floor(aspect.height * 0.1);
+          const captionY = Math.floor(aspect.height * 0.72);
+          await ffmpeg.run([
+            "-y",
+            "-i",
+            zoomedPath,
+            "-vf",
+            `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`,
+            "-c:v",
+            "libx264",
+            "-preset",
+            qual.preset,
+            "-crf",
+            String(qual.crf),
+            "-c:a",
+            "copy",
+            outPath,
+          ]);
+        } else {
+          // Standard render with title + captions (no zoom)
+          const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
+          tempFiles.push(assPath);
+          writeASS(
+            captionText.map((c) => ({
+              text: c.text,
+              startMs: c.startMs,
+              endMs: c.endMs,
+            })),
+            captionStyleName,
+            assPath,
+            aspect.width,
+            aspect.height,
+          );
+
+          const titleY = Math.floor(aspect.height * 0.1);
+          await ffmpeg.run([
+            "-y",
+            "-i",
+            renderPath,
+            "-vf",
+            `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`,
+            "-c:v",
+            "libx264",
+            "-preset",
+            qual.preset,
+            "-crf",
+            String(qual.crf),
+            "-c:a",
+            "copy",
+            outPath,
+          ]);
+        }
+
+        // Record project + render
+        db.insert(project)
+          .values({
+            id: projId,
+            name: `Standup clip: ${clip.text.slice(0, 40)}...`,
+            type: "story",
+            script: clip.text,
+            clientId: body.clientId ?? undefined,
+            createdAt: new Date(),
+          })
+          .run();
+
+        db.insert(render)
+          .values({
+            id: renderId,
+            projectId: projId,
+            status: "done",
+            outputPath: outPath,
+            settings: JSON.stringify({
+              standupClip: true,
+              startMs: clip.startMs,
+              endMs: actualEndMs,
+              score: clip.score,
+              sourceUrl: hasUrl ? body.url : undefined,
+              sourceUpload: hasLocalFile ? body.localFilePath : undefined,
+              smartZoom: zoomOnLaughter,
+              extendedForLaughter: extendLaughter && actualEndMs > clip.endMs,
+            }),
+            createdAt: new Date(),
+          })
+          .run();
+
+        projects.push({
+          projectId: projId,
+          renderId,
+          text: clip.text,
+          startMs: clip.startMs,
+          endMs: actualEndMs > clip.endMs ? actualEndMs : clip.endMs,
+          score: clip.score,
+        });
+
+        // Cleanup
+        for (const f of tempFiles) {
+          try {
+            const { unlinkSync } = await import("fs");
+            unlinkSync(f);
+          } catch {}
+        }
+      } catch (err: any) {
+        console.error(`Failed to render standup clip ${i}:`, err.message);
+        const projId = randomUUID();
+        const renderId = randomUUID();
+        db.insert(project)
+          .values({
+            id: projId,
+            name: `Standup clip: ${clip.text.slice(0, 40)}...`,
+            type: "story",
+            script: clip.text,
+            createdAt: new Date(),
+          })
+          .run();
+        db.insert(render)
+          .values({
+            id: renderId,
+            projectId: projId,
+            status: "done",
+            outputPath: clip.path,
+            settings: JSON.stringify({
+              standupClip: true,
+              startMs: clip.startMs,
+              endMs: clip.endMs,
+              score: clip.score,
+            }),
+            createdAt: new Date(),
+          })
+          .run();
+        projects.push({
+          projectId: projId,
+          renderId,
+          text: clip.text,
+          startMs: clip.startMs,
+          endMs: clip.endMs,
+          score: clip.score,
+        });
+      }
+    }
 
     return c.json({ clips: projects });
   } catch (err: any) {
@@ -2806,7 +4065,376 @@ function listBgMusic(): string[] {
 const port = Number(process.env.PORT ?? 3001);
 console.log(`crayo API running on http://localhost:${port}`);
 
+// ─── Enhancement 5: Multi-Stem Analysis Endpoint ───
+
+app.post("/api/stem-analysis", async (c) => {
+  const body = await c.req.json();
+  if (!body.audioFile || typeof body.audioFile !== "string") {
+    return c.json({ error: "audioFile path is required" }, 400);
+  }
+
+  if (!existsSync(body.audioFile)) {
+    return c.json({ error: `Audio file not found: ${body.audioFile}` }, 404);
+  }
+
+  try {
+    const { isDemucsAvailable, analyzeMultiStem, analyzeStemEnergy } =
+      await import("@crayo/ai");
+
+    const useDemucs = await isDemucsAvailable();
+
+    if (useDemucs) {
+      const analysis = await analyzeMultiStem({
+        audioPath: body.audioFile,
+        model: body.model ?? "htdemucs",
+        shifts: body.shifts ?? 1,
+        device: body.device ?? "cpu",
+      });
+
+      return c.json({
+        mode: "demucs",
+        model: body.model ?? "htdemucs",
+        bpm: analysis.bpm,
+        hasSinging: analysis.hasSinging,
+        energy: {
+          vocals: analysis.energy.vocals.averageEnergy,
+          drums: analysis.energy.drums.averageEnergy,
+          bass: analysis.energy.bass.averageEnergy,
+          other: analysis.energy.other.averageEnergy,
+        },
+        dominantTimeline: analysis.dominantTimeline,
+        stems: analysis.stems, // paths to WAV files
+      });
+    } else {
+      // Fallback to frequency-band estimation
+      const analysis = await analyzeStemEnergy(body.audioFile);
+      return c.json({
+        mode: "frequency-band-fallback",
+        note: "Install demucs for real stem separation: pip install demucs",
+        energy: {
+          vocals: analysis.vocals.energy,
+          drums: analysis.drums.energy,
+          bass: analysis.bass.energy,
+          other: analysis.other.energy,
+        },
+        timeline: analysis.timeline,
+      });
+    }
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 6: Silence Removal Endpoint ───
+
+app.post("/api/silence-detect", async (c) => {
+  const body = await c.req.json();
+  if (!body.inputPath || typeof body.inputPath !== "string") {
+    return c.json({ error: "inputPath is required" }, 400);
+  }
+  if (!existsSync(body.inputPath)) {
+    return c.json({ error: `File not found: ${body.inputPath}` }, 404);
+  }
+
+  try {
+    const { detectSilence } = await import("@crayo/ai");
+    const analysis = await detectSilence({
+      inputPath: body.inputPath,
+      threshold: body.threshold,
+      minSilenceMs: body.minSilenceMs,
+      minSpeechMs: body.minSpeechMs,
+      method: body.method,
+      motionThreshold: body.motionThreshold,
+    });
+    return c.json(analysis);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+app.post("/api/silence-remove", async (c) => {
+  const body = await c.req.json();
+  if (!body.inputPath || typeof body.inputPath !== "string") {
+    return c.json({ error: "inputPath is required" }, 400);
+  }
+  if (!body.outputPath || typeof body.outputPath !== "string") {
+    return c.json({ error: "outputPath is required" }, 400);
+  }
+  if (!existsSync(body.inputPath)) {
+    return c.json({ error: `File not found: ${body.inputPath}` }, 404);
+  }
+
+  const mode = body.mode ?? "cut";
+  if (!["cut", "speed", "margin"].includes(mode)) {
+    return c.json({ error: "mode must be cut, speed, or margin" }, 400);
+  }
+
+  try {
+    const { removeSilence } = await import("@crayo/ai");
+    const result = await removeSilence({
+      inputPath: body.inputPath,
+      outputPath: body.outputPath,
+      mode,
+      threshold: body.threshold,
+      minSilenceMs: body.minSilenceMs,
+      marginMs: body.marginMs,
+      silenceSpeed: body.silenceSpeed,
+      maxSilenceMs: body.maxSilenceMs,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 7: Face Reframe Endpoint ───
+
+app.post("/api/reframe", async (c) => {
+  const body = await c.req.json();
+  if (!body.inputPath || typeof body.inputPath !== "string") {
+    return c.json({ error: "inputPath is required" }, 400);
+  }
+  if (!body.outputPath || typeof body.outputPath !== "string") {
+    return c.json({ error: "outputPath is required" }, 400);
+  }
+  if (!existsSync(body.inputPath)) {
+    return c.json({ error: `File not found: ${body.inputPath}` }, 404);
+  }
+
+  try {
+    const { reframeVideo } = await import("@crayo/ai");
+    const result = await reframeVideo({
+      inputPath: body.inputPath,
+      outputPath: body.outputPath,
+      targetAspect: body.targetAspect ?? "9:16",
+      sampleFps: body.sampleFps,
+      smoothing: body.smoothing,
+      padding: body.padding,
+      fallback: body.fallback,
+      outputWidth: body.outputWidth,
+      multiSpeaker: body.multiSpeaker,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 8: Speech Enhancement Endpoint ───
+
+app.post("/api/speech-enhance", async (c) => {
+  const body = await c.req.json();
+  if (!body.inputPath || typeof body.inputPath !== "string") {
+    return c.json({ error: "inputPath is required" }, 400);
+  }
+  if (!body.outputPath || typeof body.outputPath !== "string") {
+    return c.json({ error: "outputPath is required" }, 400);
+  }
+  if (!existsSync(body.inputPath)) {
+    return c.json({ error: `File not found: ${body.inputPath}` }, 404);
+  }
+
+  try {
+    const { enhanceSpeech } = await import("@crayo/ai");
+    const result = await enhanceSpeech({
+      inputPath: body.inputPath,
+      outputPath: body.outputPath,
+      method: body.method,
+      model: body.model,
+      postFilter: body.postFilter,
+      noiseReduction: body.noiseReduction,
+      highpass: body.highpass,
+      lowpass: body.lowpass,
+      deesser: body.deesser,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 10: Stock Footage Endpoint ───
+
+app.post("/api/stock-search", async (c) => {
+  const body = await c.req.json();
+  if (!body.query || typeof body.query !== "string") {
+    return c.json({ error: "query is required" }, 400);
+  }
+
+  try {
+    const { searchStockFootage } = await import("@crayo/ai");
+    const result = await searchStockFootage({
+      query: body.query,
+      count: body.count,
+      orientation: body.orientation,
+      minDuration: body.minDuration,
+      maxDuration: body.maxDuration,
+      size: body.size,
+      apiKey: body.apiKey,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+app.post("/api/stock-download", async (c) => {
+  const body = await c.req.json();
+  if (!body.query || typeof body.query !== "string") {
+    return c.json({ error: "query is required" }, 400);
+  }
+
+  const outputDir = body.outputDir ?? join(OUTPUT_DIR, "stock-broll");
+
+  try {
+    const { getStockBRoll } = await import("@crayo/ai");
+    const paths = await getStockBRoll(body.query, outputDir, {
+      count: body.count,
+      orientation: body.orientation,
+      size: body.size,
+      apiKey: body.apiKey,
+    });
+    return c.json({ paths, outputDir });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 11: Timeline Export Endpoint ───
+
+app.post("/api/export-timeline", async (c) => {
+  const body = await c.req.json();
+  if (!body.clips || !Array.isArray(body.clips) || body.clips.length === 0) {
+    return c.json({ error: "clips array is required" }, 400);
+  }
+  if (!body.outputPath || typeof body.outputPath !== "string") {
+    return c.json({ error: "outputPath is required" }, 400);
+  }
+
+  try {
+    const { exportTimeline } = await import("@crayo/ai");
+    const result = exportTimeline({
+      clips: body.clips,
+      title: body.title,
+      fps: body.fps,
+      outputPath: body.outputPath,
+      format: body.format,
+      dropFrame: body.dropFrame,
+      width: body.width,
+      height: body.height,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 12: Social Publishing Endpoint ───
+
+app.post("/api/publish", async (c) => {
+  const body = await c.req.json();
+  if (!body.videoPath || typeof body.videoPath !== "string") {
+    return c.json({ error: "videoPath is required" }, 400);
+  }
+  if (!body.platforms || !Array.isArray(body.platforms) || body.platforms.length === 0) {
+    return c.json({ error: "platforms array is required (tiktok, youtube, instagram)" }, 400);
+  }
+  if (!existsSync(body.videoPath)) {
+    return c.json({ error: `File not found: ${body.videoPath}` }, 404);
+  }
+
+  try {
+    const { publishVideo } = await import("@crayo/ai");
+    const result = await publishVideo({
+      videoPath: body.videoPath,
+      platforms: body.platforms,
+      title: body.title,
+      caption: body.caption,
+      hashtags: body.hashtags,
+      scheduledAt: body.scheduledAt,
+      thumbnail: body.thumbnail,
+      privacy: body.privacy,
+      tiktok: body.tiktok,
+      youtube: body.youtube,
+      instagram: body.instagram,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 13: Split-Screen Gameplay Endpoint ───
+
+app.post("/api/split-screen", async (c) => {
+  const body = await c.req.json();
+  if (!body.mainVideo || typeof body.mainVideo !== "string") {
+    return c.json({ error: "mainVideo is required" }, 400);
+  }
+  if (!body.backgroundVideo || typeof body.backgroundVideo !== "string") {
+    return c.json({ error: "backgroundVideo is required" }, 400);
+  }
+  if (!body.outputPath || typeof body.outputPath !== "string") {
+    return c.json({ error: "outputPath is required" }, 400);
+  }
+  if (!existsSync(body.mainVideo)) {
+    return c.json({ error: `Main video not found: ${body.mainVideo}` }, 404);
+  }
+  if (!existsSync(body.backgroundVideo)) {
+    return c.json({ error: `Background video not found: ${body.backgroundVideo}` }, 404);
+  }
+
+  try {
+    const { createSplitScreen } = await import("@crayo/ai");
+    const result = await createSplitScreen({
+      mainVideo: body.mainVideo,
+      backgroundVideo: body.backgroundVideo,
+      outputPath: body.outputPath,
+      layout: body.layout,
+      mainRatio: body.mainRatio,
+      backgroundLoop: body.backgroundLoop,
+      outputWidth: body.outputWidth,
+      outputHeight: body.outputHeight,
+      blur: body.blur,
+      border: body.border,
+      fps: body.fps,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Enhancement 14: Batch Render Endpoint ───
+
+app.post("/api/batch-render", async (c) => {
+  const body = await c.req.json();
+  if (!body.sourceVideos || !Array.isArray(body.sourceVideos) || body.sourceVideos.length === 0) {
+    return c.json({ error: "sourceVideos array is required" }, 400);
+  }
+  if (!body.outputDir || typeof body.outputDir !== "string") {
+    return c.json({ error: "outputDir is required" }, 400);
+  }
+
+  try {
+    const { runBatchRender } = await import("@crayo/ai");
+    const result = await runBatchRender({
+      sourceVideos: body.sourceVideos,
+      outputDir: body.outputDir,
+      pipeline: body.pipeline ?? {},
+      naming: body.naming,
+      parallel: body.parallel,
+      continueOnError: body.continueOnError,
+      notify: body.notify,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
 export default {
   port,
   fetch: app.fetch,
+  maxRequestBodySize: MAX_UPLOAD_BYTES,
 };

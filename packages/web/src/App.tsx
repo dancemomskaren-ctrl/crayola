@@ -9,6 +9,7 @@ interface Project {
   status: string;
   script?: string;
   url?: string;
+  clientId?: string | null;
   createdAt: number;
 }
 
@@ -59,6 +60,9 @@ interface CaptionEntry {
 }
 
 export default function App() {
+  // Tab navigation
+  const [activeTab, setActiveTab] = createSignal<"create" | "projects" | "clients">("create");
+  
   const [projects, setProjects] = createSignal<Project[]>([]);
   const [templates, setTemplates] = useSignal<Template[]>([]);
   const [selectedTpl, setSelectedTpl] = useSignal<Template | null>(null);
@@ -105,9 +109,117 @@ export default function App() {
   } | null>(null);
   const [postQueue, setPostQueue] = useSignal<any[]>([]);
 
+  // Clients
+  interface Client {
+    id: string;
+    name: string;
+    notes?: string | null;
+    createdAt: number;
+  }
+  const [clients, setClients] = useSignal<Client[]>([]);
+  const [newClientName, setNewClientName] = useSignal("");
+  const [newClientNotes, setNewClientNotes] = useSignal("");
+  const [clientLoading, setClientLoading] = useSignal(false);
+  const [deliveringClientId, setDeliveringClientId] = useSignal<string | null>(null);
+  const [selectedProjectClientId, setSelectedProjectClientId] = useSignal<string>("");
+
+  async function loadClients() {
+    try {
+      const res = await fetch(`${API}/clients`);
+      if (res.ok) setClients(await res.json());
+    } catch {}
+  }
+
+  async function createClient() {
+    if (!newClientName().trim()) {
+      toast("Enter a client name first", "err");
+      return;
+    }
+    setClientLoading(true);
+    try {
+      const res = await fetch(`${API}/clients`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newClientName().trim(),
+          notes: newClientNotes().trim() || undefined,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Failed to create client");
+      }
+      setNewClientName("");
+      setNewClientNotes("");
+      toast("Client added", "ok");
+      await loadClients();
+    } catch (err: any) {
+      toast(err.message, "err");
+    } finally {
+      setClientLoading(false);
+    }
+  }
+
+  async function deleteClient(id: string) {
+    if (!confirm("Remove this client? Their projects will stay, just unassigned.")) return;
+    try {
+      await fetch(`${API}/clients/${id}`, { method: "DELETE" });
+      setClients(clients().filter((c) => c.id !== id));
+      toast("Client removed", "ok");
+    } catch {
+      toast("Failed to remove client", "err");
+    }
+  }
+
+  async function deliverForClient(id: string, name: string) {
+    setDeliveringClientId(id);
+    try {
+      const res = await fetch(`${API}/deliver/${id}`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Delivery failed");
+      if (data.delivered === 0) {
+        toast(data.message || "Nothing new to deliver", "info");
+      } else {
+        toast(`Delivered ${data.delivered} clip(s) for ${name}`, "ok");
+      }
+    } catch (err: any) {
+      toast(err.message, "err");
+    } finally {
+      setDeliveringClientId(null);
+    }
+  }
+
   // Auto clip results
   const [autoClips, setAutoClips] = useSignal<any[]>([]);
   const [autoClipLoading, setAutoClipLoading] = useSignal(false);
+
+  // Auto clip: local mp4 upload (alternative to pasting a URL)
+  const [uploadFile, setUploadFile] = useSignal<File | null>(null);
+  const [uploadedPath, setUploadedPath] = useSignal<string>("");
+  const [uploading, setUploading] = useSignal(false);
+
+  async function uploadLocalFile(file: File) {
+    setUploadFile(file);
+    setUploadedPath("");
+    setUploading(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${API}/upload`, { method: "POST", body: form });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Upload failed");
+      }
+      const data = await res.json();
+      setUploadedPath(data.path);
+      toast(`Uploaded ${file.name}`, "ok");
+    } catch (err: any) {
+      toast(err.message, "err");
+      setUploadFile(null);
+    } finally {
+      setUploading(false);
+    }
+  }
 
   // Toasts
   const [toasts, setToasts] = createSignal<
@@ -119,6 +231,8 @@ export default function App() {
   const [scriptTopic, setScriptTopic] = createSignal("");
   const [scriptStyle, setScriptStyle] = createSignal<string>("motivational");
   const [scriptDuration, setScriptDuration] = createSignal(30);
+  // Opt-in only — defaults to false every session, never auto-enabled.
+  const [ragebaitHook, setRagebaitHook] = createSignal(false);
   const [scriptLoading, setScriptLoading] = createSignal(false);
   const [generatedScript, setGeneratedScript] = createSignal<{
     hook: string;
@@ -147,6 +261,7 @@ export default function App() {
           topic: scriptTopic(),
           style: scriptStyle(),
           duration: scriptDuration(),
+          ragebaitHook: ragebaitHook(),
         }),
       });
       if (!res.ok) {
@@ -282,6 +397,7 @@ export default function App() {
     if (musicRes.ok) setMusic(await musicRes.json());
     if (analyticsRes.ok) setAnalyticsData(await analyticsRes.json());
     if (queueRes.ok) setPostQueue(await queueRes.json());
+    loadClients();
   });
 
   onCleanup(() => {
@@ -415,8 +531,11 @@ export default function App() {
 
       // Auto clip: call dedicated endpoint
       if (tpl.id === "auto_clip") {
-        if (!fields.url) {
-          throw new Error("URL is required for auto-clip");
+        const localFilePath = uploadedPath();
+        if (!fields.url && !localFilePath) {
+          throw new Error(
+            "Provide a URL or upload an mp4 for auto-clip",
+          );
         }
         setAutoClipLoading(true);
         setCreating(false);
@@ -425,7 +544,10 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            url: fields.url,
+            // Uploaded file takes priority over a pasted URL, matching
+            // the API's precedence rule.
+            url: localFilePath ? undefined : fields.url,
+            localFilePath: localFilePath || undefined,
             clipCount: settings.clipCount,
             minDuration: settings.minDuration,
             maxDuration: settings.maxDuration,
@@ -443,6 +565,49 @@ export default function App() {
         // Refresh project list
         const pRes = await fetch(`${API}/projects`);
         if (pRes.ok) setProjects(await pRes.json());
+        return;
+      }
+
+      // Standup Comedy: comedy-optimized clipping (laugh extension, smart zoom, TikTok captions)
+      if (tpl.id === "standup_comedy") {
+        const localFilePath = uploadedPath();
+        if (!fields.url && !localFilePath) {
+          throw new Error(
+            "Provide a URL or upload an mp4 for standup clipping",
+          );
+        }
+        setAutoClipLoading(true);
+        setCreating(false);
+        toast("Analyzing comedy special — this may take 1-2 mins...", "info");
+        const scRes = await fetch(`${API}/standup-clip`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            // Uploaded file takes priority over a pasted URL
+            url: localFilePath ? undefined : fields.url,
+            localFilePath: localFilePath || undefined,
+            clipCount: settings.clipCount ?? 5,
+            minDuration: settings.minDuration ?? 30,
+            maxDuration: settings.maxDuration ?? 90,
+            language: settings.language,
+            captionStyle: settings.captionStyle ?? "bold_pop",
+            platform: fields.platform ?? "9:16",
+            quality: fields.quality ?? "standard",
+            clientId: selectedProjectClientId() || undefined,
+            extendForLaughter: settings.extendForLaughter ?? true,
+            zoomOnLaughter: settings.zoomOnLaughter ?? true,
+          }),
+        });
+        setAutoClipLoading(false);
+        if (!scRes.ok) {
+          const err = await scRes.json();
+          throw new Error(err.error || "Standup clip failed");
+        }
+        const scData = await scRes.json();
+        setAutoClips(scData.clips.map((c: any) => ({ ...c, template: "standup" })));
+        toast(`Found ${scData.clips.length} comedy highlight clips`, "ok");
+        const pRes2 = await fetch(`${API}/projects`);
+        if (pRes2.ok) setProjects(await pRes2.json());
         return;
       }
 
@@ -623,6 +788,7 @@ export default function App() {
           type: tpl.defaults.type ?? tpl.id,
           script: settings.script,
           url: settings.url,
+          clientId: selectedProjectClientId() || undefined,
         }),
       });
       if (!res.ok) {
@@ -829,9 +995,113 @@ export default function App() {
           <span class="text-brand">Crayo</span> Local
         </h1>
         <p class="text-sm text-zinc-400 mt-1">AI short-form video generator</p>
+        <nav class="flex gap-1 mt-4">
+          <For each={[
+            { id: "create" as const, label: "Create" },
+            { id: "projects" as const, label: "Projects" },
+            { id: "clients" as const, label: "Clients" },
+          ]}>
+            {(tab) => (
+              <button
+                onClick={() => setActiveTab(tab.id)}
+                class={`px-4 py-2 text-sm font-medium rounded-lg transition ${
+                  activeTab() === tab.id
+                    ? "bg-brand text-white"
+                    : "text-zinc-400 hover:text-white hover:bg-zinc-800"
+                }`}
+              >
+                {tab.label}
+              </button>
+            )}
+          </For>
+        </nav>
       </header>
 
       <main class="max-w-5xl mx-auto px-6 py-8">
+        {/* ═══ Clients Tab ═══ */}
+        <Show when={activeTab() === "clients"}>
+          <div class="bg-zinc-900 rounded-xl p-6 border border-zinc-800 mb-8">
+            <h2 class="text-lg font-semibold mb-4">🏛️ Clients</h2>
+
+            {/* Add client form */}
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+              <input
+                type="text"
+                value={newClientName()}
+                onInput={(e) => setNewClientName(e.currentTarget.value)}
+                placeholder="Client name (e.g. Grace Community Church)"
+                class="md:col-span-1 bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand"
+              />
+              <input
+                type="text"
+                value={newClientNotes()}
+                onInput={(e) => setNewClientNotes(e.currentTarget.value)}
+                placeholder="Notes (contact, contract terms, etc.) — optional"
+                class="md:col-span-1 bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand"
+              />
+              <button
+                onClick={createClient}
+                disabled={clientLoading() || !newClientName().trim()}
+                class="bg-brand hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold px-4 py-2 rounded-lg transition"
+              >
+                {clientLoading() ? "Adding..." : "+ Add Client"}
+              </button>
+            </div>
+
+            {/* Client list */}
+            <Show
+              when={clients().length > 0}
+              fallback={
+                <p class="text-sm text-zinc-500">
+                  No clients yet. Add your first church or account above.
+                </p>
+              }
+            >
+              <div class="space-y-3">
+                <For each={clients()}>
+                  {(cl) => {
+                    const clientProjectCount = () =>
+                      projects().filter((p: any) => p.clientId === cl.id).length;
+                    return (
+                      <div class="bg-zinc-800 rounded-lg p-4 border border-zinc-700 flex items-center justify-between gap-4">
+                        <div class="flex-1 min-w-0">
+                          <div class="font-medium text-white">{cl.name}</div>
+                          <Show when={cl.notes}>
+                            <div class="text-xs text-zinc-500 mt-0.5 truncate">
+                              {cl.notes}
+                            </div>
+                          </Show>
+                          <div class="text-xs text-zinc-500 mt-1">
+                            {clientProjectCount()} project{clientProjectCount() === 1 ? "" : "s"}
+                          </div>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                          <button
+                            onClick={() => deliverForClient(cl.id, cl.name)}
+                            disabled={deliveringClientId() === cl.id}
+                            class="text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg transition"
+                            title="Copy all finished, undelivered clips for this client into a labeled delivery folder"
+                          >
+                            {deliveringClientId() === cl.id ? "Delivering..." : "📦 Deliver Clips"}
+                          </button>
+                          <button
+                            onClick={() => deleteClient(cl.id)}
+                            class="text-sm text-zinc-500 hover:text-red-400 px-2 py-1.5 rounded-lg transition"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+          </div>
+        </Show>
+
+        {/* ═══ Create Tab ═══ */}
+        <Show when={activeTab() === "create"}>
         {/* Script Writer */}
         <Show when={!selectedTpl()}>
           <div class="bg-zinc-900 rounded-xl p-6 border border-zinc-800 mb-8">
@@ -880,6 +1150,18 @@ export default function App() {
                   class="w-full accent-brand"
                 />
               </div>
+              <label
+                class="flex items-center gap-2 text-sm text-zinc-300 select-none"
+                title="Off by default. Writes a curiosity-gap hook (implication, unanswered question) instead of a flat statement. Still bound by the same no-false-claims rules as every other style."
+              >
+                <input
+                  type="checkbox"
+                  checked={ragebaitHook()}
+                  onChange={(e) => setRagebaitHook(e.currentTarget.checked)}
+                  class="accent-brand w-4 h-4"
+                />
+                Ragebait / curiosity hook (opt-in)
+              </label>
               <button
                 onClick={generateScript}
                 disabled={scriptLoading() || !scriptTopic().trim()}
@@ -1172,17 +1454,34 @@ export default function App() {
               </h2>
             </div>
 
-            <div class="mb-4">
-              <label class="block text-sm text-zinc-400 mb-1">
-                Project Name
-              </label>
-              <input
-                type="text"
-                value={name()}
-                onInput={(e) => setName(e.currentTarget.value)}
-                placeholder="My viral video"
-                class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand"
-              />
+            <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div class="md:col-span-2">
+                <label class="block text-sm text-zinc-400 mb-1">
+                  Project Name
+                </label>
+                <input
+                  type="text"
+                  value={name()}
+                  onInput={(e) => setName(e.currentTarget.value)}
+                  placeholder="My viral video"
+                  class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand"
+                />
+              </div>
+              <div>
+                <label class="block text-sm text-zinc-400 mb-1">
+                  Client (optional)
+                </label>
+                <select
+                  value={selectedProjectClientId()}
+                  onChange={(e) => setSelectedProjectClientId(e.currentTarget.value)}
+                  class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-brand"
+                >
+                  <option value="">— None —</option>
+                  <For each={clients()}>
+                    {(cl) => <option value={cl.id}>{cl.name}</option>}
+                  </For>
+                </select>
+              </div>
             </div>
 
             {/* Dynamic template fields */}
@@ -1200,8 +1499,50 @@ export default function App() {
                         updateField(field.key, e.currentTarget.value)
                       }
                       placeholder={field.placeholder}
-                      class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand"
+                      disabled={
+                        field.key === "url" && !!uploadedPath()
+                      }
+                      class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-brand disabled:opacity-40"
                     />
+                  </Show>
+                  {/* Local mp4 upload — alternative to pasting a URL for Auto Clip & Standup Comedy */}
+                  <Show when={(selectedTpl()!.id === "auto_clip" || selectedTpl()!.id === "standup_comedy") && field.key === "url"}>
+                    <div class="mt-2 flex items-center gap-3">
+                      <span class="text-xs text-zinc-500">or</span>
+                      <label class="flex items-center gap-2 text-sm bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 cursor-pointer hover:border-brand">
+                        <input
+                          type="file"
+                          accept="video/mp4,.mp4"
+                          class="hidden"
+                          onChange={(e) => {
+                            const f = e.currentTarget.files?.[0];
+                            if (f) uploadLocalFile(f);
+                          }}
+                        />
+                        {uploading()
+                          ? "Uploading..."
+                          : uploadFile()
+                            ? uploadFile()!.name
+                            : "Upload mp4"}
+                      </label>
+                      <Show when={uploadedPath()}>
+                        <button
+                          type="button"
+                          class="text-xs text-zinc-400 hover:text-white"
+                          onClick={() => {
+                            setUploadFile(null);
+                            setUploadedPath("");
+                          }}
+                        >
+                          Clear
+                        </button>
+                      </Show>
+                    </div>
+                    <Show when={uploadedPath()}>
+                      <p class="text-xs text-emerald-400 mt-1">
+                        Using uploaded file — URL field ignored
+                      </p>
+                    </Show>
                   </Show>
                   <Show when={field.type === "textarea"}>
                     <textarea
@@ -1668,6 +2009,11 @@ export default function App() {
           </div>
         </Show>
 
+        </Show>
+        {/* ═══ End Create Tab ═══ */}
+
+        {/* ═══ Projects Tab ═══ */}
+        <Show when={activeTab() === "projects"}>
         {/* Project List */}
         <div class="bg-zinc-900 rounded-xl p-6 border border-zinc-800">
           <h2 class="text-lg font-semibold mb-4">Projects</h2>
@@ -1695,6 +2041,11 @@ export default function App() {
                         <span class="text-xs text-zinc-400 bg-zinc-700 px-2 py-0.5 rounded">
                           {p.type}
                         </span>
+                        <Show when={p.clientId}>
+                          <span class="text-xs text-emerald-300 bg-emerald-900/40 px-2 py-0.5 rounded">
+                            🏛️ {clients().find((c) => c.id === p.clientId)?.name ?? "Unknown client"}
+                          </span>
+                        </Show>
                         <span class="text-xs text-zinc-500">
                           {formatDate(p.createdAt)}
                         </span>
@@ -1806,7 +2157,11 @@ export default function App() {
           </Show>
         </div>
 
-        {/* Media Library */}
+        </Show>
+        {/* ═══ End Projects Tab ═══ */}
+
+        {/* Media Library — visible on Create tab */}
+        <Show when={activeTab() === "create"}>
         <div class="bg-zinc-900 rounded-xl p-6 border border-zinc-800 mt-6">
           <h2 class="text-lg font-semibold mb-4">Media Library</h2>
 
@@ -1878,6 +2233,8 @@ export default function App() {
             </Show>
           </div>
         </div>
+        </Show>
+        {/* ═══ End Media Library (Create tab) ═══ */}
       </main>
     </div>
   );

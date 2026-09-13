@@ -442,7 +442,9 @@ export function listVoices(): VoiceInfo[] {
 // ─── Script Generation (DeepSeek API) ───
 
 const DEFAULT_API_BASE = "https://api.deepseek.com";
-const DEFAULT_MODEL = "deepseek-chat";
+// The legacy "deepseek-chat" / "deepseek-reasoner" aliases were retired
+// on 2026-07-24 and no longer resolve. Override with DEEPSEEK_MODEL.
+const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 
 export async function generateScript(
   opts: GenerateScriptOpts,
@@ -619,6 +621,23 @@ async function edgeTTS(opts: TTSOpts): Promise<string> {
 
 // ─── STT (Speech-to-Text) ───
 
+/**
+ * Resolve which Whisper model to use.
+ *
+ * medium is a large accuracy gain over "base" on sermon audio:
+ * theological vocabulary, scripture references and proper nouns.
+ * Highlight selection reads this transcript, so errors here propagate
+ * into which clips get chosen. The .en variant is more accurate but
+ * English-only, so fall back to multilingual "medium" for other
+ * languages. Override with WHISPER_MODEL ("large-v3" for best accuracy,
+ * "base" or "small.en" for speed).
+ */
+function resolveWhisperModel(language?: string): string {
+  const override = process.env.WHISPER_MODEL;
+  if (override) return override;
+  return (language ?? "en") === "en" ? "medium.en" : "medium";
+}
+
 export async function speechToText(opts: STTOpts): Promise<Caption[]> {
   if (!existsSync(opts.inputPath)) {
     throw new Error(`Audio file not found: ${opts.inputPath}`);
@@ -628,12 +647,26 @@ export async function speechToText(opts: STTOpts): Promise<Caption[]> {
   mkdirSync(tmpDir, { recursive: true });
 
   try {
+    const model = resolveWhisperModel(opts.language);
+
+    // Prefer faster-whisper: same weights via CTranslate2 int8, roughly
+    // 4x faster on ~60% of the RAM, which is what makes `medium` viable
+    // on a laptop. Falls back to the reference `whisper` CLI when
+    // faster-whisper is not installed, so transcription never hard-fails
+    // on a machine that only has the original package.
+    const fastResult = await transcribeWithFasterWhisper(
+      opts,
+      tmpDir,
+      model,
+    );
+    if (fastResult) return fastResult;
+
     const proc = Bun.spawn(
       [
         "whisper",
         opts.inputPath,
         "--model",
-        "base",
+        model,
         "--output_format",
         "json",
         "--output_dir",
@@ -679,6 +712,77 @@ export async function speechToText(opts: STTOpts): Promise<Caption[]> {
       rmSync(tmpDir);
     } catch {}
   }
+}
+
+/**
+ * Try transcribing via faster-whisper (CTranslate2, int8).
+ *
+ * Returns null — rather than throwing — when faster-whisper is simply not
+ * installed, so the caller can fall back to the reference whisper CLI.
+ * A genuine transcription failure (bad audio, corrupt model) does throw,
+ * because silently falling back would hide a real problem behind a much
+ * slower second attempt that fails the same way.
+ *
+ * Exit codes from transcribe_fast.py:
+ *   0 = success, 2 = bad args, 3 = faster-whisper not installed
+ */
+async function transcribeWithFasterWhisper(
+  opts: STTOpts,
+  tmpDir: string,
+  model: string,
+): Promise<Caption[] | null> {
+  if (process.env.WHISPER_BACKEND === "openai") return null;
+
+  const scriptPath = join(__dirname, "transcribe_fast.py");
+  if (!existsSync(scriptPath)) return null;
+
+  const jsonPath = join(tmpDir, "faster-whisper.json");
+
+  const proc = Bun.spawn(
+    [
+      "python3",
+      scriptPath,
+      opts.inputPath,
+      jsonPath,
+      model,
+      opts.language ?? "en",
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+
+  const stderr = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+
+  // 3 = faster-whisper not installed. Not an error; use the fallback.
+  if (exitCode === 3) {
+    console.warn(
+      "faster-whisper not installed, falling back to whisper CLI. " +
+        "Install with: pip install faster-whisper",
+    );
+    return null;
+  }
+
+  // python3 itself missing, or the script could not start at all.
+  if (exitCode !== 0 && !existsSync(jsonPath)) {
+    console.warn(
+      `faster-whisper unavailable (exit ${exitCode}), ` +
+        `falling back to whisper CLI: ${stderr.slice(-300)}`,
+    );
+    return null;
+  }
+
+  if (exitCode !== 0) {
+    throw new Error(
+      `faster-whisper failed (exit ${exitCode}): ${stderr.slice(-500)}`,
+    );
+  }
+
+  if (!existsSync(jsonPath)) {
+    throw new Error("faster-whisper did not produce output");
+  }
+
+  const data = JSON.parse(readFileSync(jsonPath, "utf-8"));
+  return parseWhisperOutput(data);
 }
 
 function parseWhisperOutput(data: any): Caption[] {
@@ -843,7 +947,9 @@ export interface AutoClipResult {
     endMs: number;
     text: string;
     score: number;
+    suggestedTitle?: string;
   }[];
+  allCaptions?: Caption[];
 }
 
 const HOOK_WORDS = new Set([
@@ -1092,22 +1198,11 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
     const startSec = h.startMs / 1000;
     const durSec = (h.endMs - h.startMs) / 1000;
 
-    const clipProc = Bun.spawn(
-      [
-        ffmpegPath,
-        "-y",
-        "-ss",
-        String(startSec),
-        "-i",
-        sourcePath,
-        "-t",
-        String(durSec),
-        "-c",
-        "copy",
-        clipPath,
-      ],
-      { stdout: "pipe", stderr: "pipe" },
-    );
+    const clipProc = Bun.spawn([
+      ffmpegPath, "-y", "-ss", String(startSec), "-i",
+      sourcePath, "-t", String(durSec), "-c", "copy", clipPath,
+    ], { stdout: "pipe", stderr: "pipe" });
+
     if ((await clipProc.exited) === 0 && existsSync(clipPath)) {
       clips.push({
         path: clipPath,
@@ -1115,11 +1210,12 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
         endMs: h.endMs,
         text: h.text,
         score: h.score,
+        suggestedTitle: "",
       });
     }
   }
 
-  return { sourcePath, clips };
+  return { sourcePath, clips, allCaptions: captions };
 }
 
 export interface FaceKeyframe {
@@ -1368,3 +1464,19 @@ export async function removeSilence(
     segments: speaking.length,
   };
 }
+
+// ─── Multimodal AI Clipping ───
+export {
+  autoClipPro,
+  detectChapters,
+  generateClipTitles,
+  analyzeSentiment,
+  extractKeywords,
+  detectTopic,
+} from "./multimodal-clip";
+export type {
+  VideoChapter,
+  ChapterAnalysis,
+  MultimodalHighlight,
+  MultimodalClipResult,
+} from "./multimodal-clip";

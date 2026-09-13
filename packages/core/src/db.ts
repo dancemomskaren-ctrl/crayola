@@ -11,6 +11,13 @@ const DB_PATH = join(DATA_DIR, "crayo.db");
 const sqlite = new Database(DB_PATH);
 export const db = drizzle(sqlite);
 
+export const client = sqliteTable("client", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(), // e.g. "Grace Community Church"
+  notes: text("notes"), // contact info, contract terms, whatever's useful
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
 export const project = sqliteTable("project", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
@@ -18,6 +25,7 @@ export const project = sqliteTable("project", {
   status: text("status").notNull().default("draft"), // draft | rendering | done | error
   script: text("script"),
   url: text("url"),
+  clientId: text("client_id"), // nullable — internal/test projects have no client
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -29,6 +37,7 @@ export const render = sqliteTable("render", {
   outputPath: text("output_path"),
   error: text("error"),
   settings: text("settings"), // JSON string
+  deliveredAt: integer("delivered_at", { mode: "timestamp" }), // set when copied to a client delivery folder
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -98,6 +107,12 @@ export const postQueue = sqliteTable("post_queue", {
 });
 
 sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS client (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    notes TEXT,
+    created_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS project (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -105,6 +120,7 @@ sqlite.exec(`
     status TEXT NOT NULL DEFAULT 'draft',
     script TEXT,
     url TEXT,
+    client_id TEXT,
     created_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS render (
@@ -115,6 +131,7 @@ sqlite.exec(`
     output_path TEXT,
     error TEXT,
     settings TEXT,
+    delivered_at INTEGER,
     created_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS asset (
@@ -174,3 +191,28 @@ sqlite.exec(`
     created_at INTEGER NOT NULL
   );
 `);
+
+// Migration: add client_id to an existing project table that predates
+// the client feature. CREATE TABLE IF NOT EXISTS above only helps on a
+// fresh DB — existing installs need ALTER TABLE. SQLite has no
+// "ADD COLUMN IF NOT EXISTS", so check pragma first and skip if present.
+{
+  const cols = sqlite.query(`PRAGMA table_info(project)`).all() as {
+    name: string;
+  }[];
+  const hasClientId = cols.some((c) => c.name === "client_id");
+  if (!hasClientId) {
+    sqlite.exec(`ALTER TABLE project ADD COLUMN client_id TEXT;`);
+  }
+}
+
+// Migration: add delivered_at to an existing render table.
+{
+  const cols = sqlite.query(`PRAGMA table_info(render)`).all() as {
+    name: string;
+  }[];
+  const hasDeliveredAt = cols.some((c) => c.name === "delivered_at");
+  if (!hasDeliveredAt) {
+    sqlite.exec(`ALTER TABLE render ADD COLUMN delivered_at INTEGER;`);
+  }
+}
