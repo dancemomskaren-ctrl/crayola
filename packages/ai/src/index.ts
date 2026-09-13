@@ -1012,6 +1012,11 @@ const HOOK_WORD_BOOST = 1.2;
 const QUIET_AFTER_BOOST = 1.4;
 const POSITION_BEGINNING_BOOST = 1.1;
 
+const SCRIPTURE_BOOK = /\b(?:Genesis|Exodus|Leviticus|Numbers|Deuteronomy|Joshua|Judges|Ruth|Samuel|Kings|Chronicles|Ezra|Nehemiah|Esther|Job|Psalms?|Proverbs|Ecclesiastes|Song of (?:Solomon|Songs)|Isaiah|Jeremiah|Lamentations|Ezekiel|Daniel|Hosea|Joel|Amos|Obadiah|Jonah|Micah|Nahum|Habakkuk|Zephaniah|Haggai|Zechariah|Malachi|Matthew|Mark|Luke|John|Acts|Romans|Corinthians|Galatians|Ephesians|Philippians|Colossians|Thessalonians|Timothy|Titus|Philemon|Hebrews|James|Peter|Jude|Revelation)\b/i;
+const ALTAR_CALL = /\b(?:come forward|repeat after me|raise your hands?|give your life to (?:Jesus|Christ)|accept Jesus|altar call)\b/i;
+const TESTIMONY = /\b(?:I was|God healed|before I knew Christ|my testimony|Jesus saved me|God delivered me)\b/i;
+const AUDIENCE_PEAK = /(?:\[|\()(?:audience\s+)?(?:laughter|laughing|applause|applauding|cheering)(?:\]|\))/i;
+
 export function detectHighlights(
   captions: Caption[],
   opts?: { clipCount?: number; minDuration?: number; maxDuration?: number },
@@ -1057,8 +1062,11 @@ export function detectHighlights(
     const lower = s.text.toLowerCase();
 
     // Hook words
-    const hookCount = [...HOOK_WORDS].filter((w) => lower.includes(w)).length;
-    score *= 1 + hookCount * (HOOK_WORD_BOOST - 1);
+    const hookCount = [...HOOK_WORDS].filter((w) =>
+      new RegExp(`\\b${w}\\b`, "i").test(lower),
+    ).length;
+    // Cap generic hooks so keyword stuffing cannot outrank ministry moments.
+    score *= 1 + Math.min(3, hookCount) * (HOOK_WORD_BOOST - 1);
 
     // Exclamation marks
     if (s.text.includes("!")) score *= EXCLAMATION_BOOST;
@@ -1078,6 +1086,13 @@ export function detectHighlights(
     const posRatio = s.startMs / totalDur;
     if (posRatio < 0.15) score *= POSITION_BEGINNING_BOOST;
     if (posRatio > 0.85) score *= POSITION_BEGINNING_BOOST;
+
+    // Add church signals after generic boosts so each carries more weight.
+    if (SCRIPTURE_BOOK.test(s.text)) score += 5;
+    if (/\b\d{1,3}\s*:\s*\d{1,3}(?:\s*[-–]\s*\d{1,3})?\b/.test(s.text)) score += 6;
+    if (ALTAR_CALL.test(s.text)) score += 8;
+    if (TESTIMONY.test(s.text)) score += 6;
+    if (AUDIENCE_PEAK.test(s.text)) score += 6;
 
     return { ...s, score, wordCount };
   });

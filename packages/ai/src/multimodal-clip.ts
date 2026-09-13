@@ -361,7 +361,7 @@ function mergeSimilarChapters(chapters: VideoChapter[]): VideoChapter[] {
   }));
 }
 
-function analyzeSentiment(text: string): VideoChapter["sentiment"] {
+export function analyzeSentiment(text: string): VideoChapter["sentiment"] {
   const positive = ["great", "amazing", "wonderful", "blessed", "joy", "love", "hope", "faith", "praise", "glory", "victory"];
   const negative = ["struggle", "pain", "suffer", "difficult", "hard", "challenge", "problem", "failure", "loss", "death"];
 
@@ -373,7 +373,7 @@ function analyzeSentiment(text: string): VideoChapter["sentiment"] {
   return score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
 }
 
-function extractKeywords(text: string): string[] {
+export function extractKeywords(text: string): string[] {
   const STOP_WORDS = new Set([
     "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "from",
     "is", "was", "are", "were", "be", "been", "have", "has", "had", "do", "does", "did",
@@ -396,7 +396,7 @@ function extractKeywords(text: string): string[] {
     .map(([w]) => w);
 }
 
-function detectTopic(text: string, keywords: string[]): string {
+export function detectTopic(text: string, keywords: string[]): string {
   const lower = text.toLowerCase();
 
   if (lower.includes("sermon") || lower.includes("pastor") || lower.includes("preach")) return "sermon";
