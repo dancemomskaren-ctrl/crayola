@@ -9,7 +9,7 @@ Work through these in order. One task at a time. Commit after each.
 
 - [x] **christian-clip-titles:** In `packages/ai/src/index.ts`, add `generateChristianClipTitle(text: string, apiKey: string, apiBase: string): Promise<string>` that uses the LLM to generate a short viral-ready clip title for church social media (e.g. "Pastor's 30-second testimony will wreck you 😭"). Wire it up in the `/api/auto-clip` route so each clip gets a `suggestedTitle`.
 
-- [ ] **sermon-template-upgrade:** In `packages/core/src/templates.ts`, add 3 new sermon clip caption styles: `"scripture"` (bold gold text, dark bg, reference shown below), `"testimony"` (handwritten-feel font, warm tone), `"altar-call"` (urgent red/white, pulsing animation class). Add these as options to the sermon_clip template fields.
+- [x] **sermon-template-upgrade:** In `packages/core/src/templates.ts`, add 3 new sermon clip caption styles: `"scripture"` (bold gold text, dark bg, reference shown below), `"testimony"` (handwritten-feel font, warm tone), `"altar-call"` (urgent red/white, pulsing animation class). Add these as options to the sermon_clip template fields.
 
 - [ ] **church-branding-watermark:** Add a watermark/logo overlay to rendered sermon clips. API route: `POST /api/clients/:id/branding` accepts `{ logoUrl: string, position: "top-left"|"top-right"|"bottom-left"|"bottom-right", opacity: number }`. Store in client DB record. Apply watermark in FFmpeg render pipeline when client has branding set.
 

@@ -1,3 +1,19 @@
+import type { ASSStyle } from "./ass";
+
+const SERMON_BASE: ASSStyle = {
+  name: "Sermon", fontname: "Arial", fontsize: 54,
+  primaryColor: "&H00FFFFFF&", secondaryColor: "&H00FFFFFF&",
+  outlineColor: "&H00181818&", shadowColor: "&H80000000&",
+  bold: 1, italic: 0, outline: 3, shadow: 2, alignment: 2,
+  marginL: 60, marginR: 60, marginV: 100, encoding: 1,
+};
+
+export const SERMON_CAPTION_STYLES: Record<string, ASSStyle & { animationClass?: string }> = {
+  scripture: { ...SERMON_BASE, name: "Scripture", primaryColor: "&H0037D4F4&", borderStyle: 3, outline: 12 },
+  testimony: { ...SERMON_BASE, name: "Testimony", fontname: "Chalkboard", primaryColor: "&H00C5E4FF&", outlineColor: "&H002B3449&", bold: 0 },
+  "altar-call": { ...SERMON_BASE, name: "AltarCall", fontname: "Arial Black", outlineColor: "&H002525DC&", outline: 5, animationClass: "animate-pulse" },
+};
+
 export interface Template {
   id: string;
   name: string;
@@ -906,10 +922,16 @@ export const TEMPLATES: Template[] = [
         default: 60,
       },
       {
+        key: "scriptureReference", label: "Scripture Reference", type: "text", placeholder: "John 3:16",
+      },
+      {
         key: "captionStyle",
         label: "Caption Style",
         type: "select",
         options: [
+          { value: "scripture", label: "Scripture (gold with reference)" },
+          { value: "testimony", label: "Testimony (warm handwritten)" },
+          { value: "altar-call", label: "Altar Call (red and white pulse)" },
           { value: "holy_glow", label: "Holy Glow (reverent)" },
           { value: "cross_bold", label: "Cross Bold (strong)" },
           { value: "worship_purple", label: "Worship Purple (praise)" },

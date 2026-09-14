@@ -631,6 +631,7 @@ export default function App() {
             platform: settings.platform,
             quality: settings.quality,
             captionStyle: settings.captionStyle,
+            scriptureReference: fields.scriptureReference || settings.scriptureReference,
             transition: settings.transition,
             smartZoom: settings.smartZoom,
             hookIntro: settings.hookIntro,

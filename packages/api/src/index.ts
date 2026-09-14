@@ -1168,6 +1168,7 @@ app.post("/api/sermon-clip", async (c) => {
     const bgClips = listStockClips();
 
     const ASS_STYLES = new Set([
+      "scripture", "testimony", "altar-call",
       "typewriter",
       "bounce",
       "shake",
@@ -1302,6 +1303,7 @@ app.post("/api/sermon-clip", async (c) => {
             writeASS(
               grouped.map((t) => ({
                 text: t.text,
+                reference: String(body.scriptureReference ?? ""),
                 startMs: t.startMs,
                 endMs: t.endMs,
               })),
@@ -3112,6 +3114,7 @@ async function processBatch(batchId: string, body: any) {
   const bgClips = listStockClips();
 
   const ASS_STYLES = new Set([
+    "scripture", "testimony", "altar-call",
     "typewriter",
     "bounce",
     "shake",
@@ -3263,6 +3266,7 @@ async function processBatch(batchId: string, body: any) {
           writeASS(
             grouped.map((t) => ({
               text: t.text,
+              reference: String(body.scriptureReference ?? ""),
               startMs: t.startMs,
               endMs: t.endMs,
             })),

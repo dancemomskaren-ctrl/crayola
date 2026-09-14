@@ -1,4 +1,5 @@
 import { writeFileSync } from "fs";
+import { SERMON_CAPTION_STYLES } from "./templates";
 
 export interface ASSEvent {
   start: string; // HH:MM:SS.cc
@@ -24,6 +25,7 @@ export interface ASSStyle {
   marginR: number;
   marginV: number;
   encoding: number;
+  borderStyle?: number;
 }
 
 export interface CaptionAnim {
@@ -31,6 +33,7 @@ export interface CaptionAnim {
   startMs: number;
   endMs: number;
   style?: string;
+  reference?: string;
 }
 
 // Color format: #RRGGBB → &HBBGGRR&
@@ -50,6 +53,7 @@ function msToASS(ms: number): string {
 }
 
 const DEFAULT_STYLES: Record<string, ASSStyle> = {
+  ...SERMON_CAPTION_STYLES,
   bold_pop: {
     name: "BoldPop",
     fontname: "Arial",
@@ -504,7 +508,7 @@ function generateASSHeader(
   const styleLines = styles
     .map(
       (s) =>
-        `Style: ${s.name},${s.fontname},${s.fontsize},${s.primaryColor},${s.secondaryColor},${s.outlineColor},${s.shadowColor},${s.bold},${s.italic},-1,0,0,0,100,100,0,1,${s.outline},${s.shadow},${s.alignment},${s.marginL},${s.marginR},${s.marginV},${s.encoding}`,
+        `Style: ${s.name},${s.fontname},${s.fontsize},${s.primaryColor},${s.secondaryColor},${s.outlineColor},${s.shadowColor},${s.bold},${s.italic},0,0,100,100,0,0,${s.borderStyle ?? 1},${s.outline},${s.shadow},${s.alignment},${s.marginL},${s.marginR},${s.marginV},${s.encoding}`,
     )
     .join("\n");
 
@@ -546,6 +550,23 @@ export function generateASS(
     if (!text) continue;
 
     switch (styleName) {
+      case "scripture":
+      case "testimony":
+      case "altar-call": {
+        const safeText = text.replace(/[{}\\]/g, "").replace(/\r?\n/g, " ");
+        const reference = cap.reference?.replace(/[{}\\]/g, "").replace(/\s+/g, " ").trim();
+        let tags = "{\\fad(150,150)}";
+        if (styleName === "altar-call") {
+          tags = "{\\fscx100\\fscy100";
+          for (let t = 0; t < cap.endMs - cap.startMs; t += 800) {
+            tags += `\\t(${t},${t + 400},\\fscx106\\fscy106)\\t(${t + 400},${t + 800},\\fscx100\\fscy100)`;
+          }
+          tags += "}";
+        }
+        events.push({ start: msToASS(cap.startMs), end: msToASS(cap.endMs), style: styleDef.name,
+          text: tags + safeText + (styleName === "scripture" && reference ? `\\N{\\fs34}${reference}` : "") });
+        break;
+      }
       case "typewriter":
         events.push(...animTypewriter(text, cap.startMs, cap.endMs));
         allStyles.add("Typewriter");
