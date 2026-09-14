@@ -90,6 +90,59 @@ app.post("/api/upload", async (c) => {
 // none. This is intentionally simple: no auth-scoping per client here,
 // just a tag for organizing and filtering your own work.
 
+app.post("/api/clients/:id/branding", async (c) => {
+  const id = c.req.param("id");
+  if (!db.select().from(client).where(eq(client.id, id)).get()) return c.json({ error: "Client not found" }, 404);
+  const body = await c.req.json();
+  if (!body || typeof body.logoUrl !== "string" || !["top-left", "top-right", "bottom-left", "bottom-right"].includes(body.position) || typeof body.opacity !== "number" || !Number.isFinite(body.opacity) || body.opacity < 0 || body.opacity > 1) {
+    return c.json({ error: "Provide logoUrl, a valid corner position, and opacity between 0 and 1." }, 400);
+  }
+  try {
+    const url = new URL(body.logoUrl);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("Invalid URL");
+  } catch { return c.json({ error: "logoUrl must be an HTTP or HTTPS URL without credentials." }, 400); }
+  const logoPath = join(UPLOADS_DIR, `${randomUUID()}-logo.png`);
+  const sourcePath = `${logoPath}.source`;
+  try {
+    const response = await fetch(body.logoUrl, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok || !response.headers.get("content-type")?.startsWith("image/")) throw new Error("Logo URL must return an image.");
+    const reader = response.body!.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > 5 * 1024 * 1024) throw new Error("Logo must be smaller than 5 MB.");
+        chunks.push(value);
+      }
+    } finally { await reader.cancel(); }
+    await Bun.write(sourcePath, new Blob(chunks));
+    const { ffmpeg } = await import("@crayo/core");
+    await ffmpeg.run(["-i", sourcePath, "-frames:v", "1", "-vf", "scale=512:512:force_original_aspect_ratio=decrease", logoPath]);
+    const branding = { logoUrl: body.logoUrl, logoPath, position: body.position, opacity: body.opacity };
+    db.update(client).set({ branding }).where(eq(client.id, id)).run();
+    return c.json({ logoUrl: branding.logoUrl, position: branding.position, opacity: branding.opacity });
+  } catch (err: any) {
+    if (existsSync(logoPath)) unlinkSync(logoPath);
+    return c.json({ error: `Unable to save branding: ${err.message}` }, 400);
+  } finally { if (existsSync(sourcePath)) unlinkSync(sourcePath); }
+});
+
+async function applyClientBranding(clientId: string | undefined | null, path: string) {
+  if (!clientId) return;
+  const row = db.select().from(client).where(eq(client.id, clientId)).get();
+  if (!row) throw new Error("clientId does not match an existing client");
+  if (!row.branding) return;
+  const { ffmpeg } = await import("@crayo/core");
+  const brandedPath = `${path}.branded.mp4`;
+  try {
+    await ffmpeg.overlayWatermark(path, brandedPath, row.branding);
+    renameSync(brandedPath, path);
+  } finally { if (existsSync(brandedPath)) unlinkSync(brandedPath); }
+}
+
 app.get("/api/clients", async (c) => {
   const rows = db.select().from(client).all();
   return c.json(rows);
@@ -997,9 +1050,12 @@ app.post("/api/auto-clip", async (c) => {
           outPath,
         ]);
 
+        await applyClientBranding(body.clientId, outPath);
+
         db.insert(project)
           .values({
             id: projId,
+            clientId: body.clientId ?? null,
             name: clip.suggestedTitle!,
             type: "story",
             script: clip.text,
@@ -1043,6 +1099,7 @@ app.post("/api/auto-clip", async (c) => {
           } catch {}
         }
       } catch (err: any) {
+        if (body.clientId) throw err;
         console.error(`Failed to render clip ${i}:`, err.message);
         // Still create a project record with the raw clip as fallback
         const projId = randomUUID();
@@ -1050,6 +1107,7 @@ app.post("/api/auto-clip", async (c) => {
         db.insert(project)
           .values({
             id: projId,
+            clientId: body.clientId ?? null,
             name: clip.suggestedTitle!,
             type: "story",
             script: clip.text,
@@ -1352,9 +1410,12 @@ app.post("/api/sermon-clip", async (c) => {
           renameSync(withHookPath, outPath);
         }
 
+        await applyClientBranding(body.clientId, outPath);
+
         db.insert(project)
           .values({
             id: projId,
+            clientId: body.clientId ?? null,
             name: `Sermon: ${clip.text.slice(0, 40)}...`,
             type: "sermon_clip",
             script: clip.text,
@@ -1417,6 +1478,7 @@ app.post("/api/sermon-clip", async (c) => {
         db.insert(project)
           .values({
             id: projId,
+            clientId: body.clientId ?? null,
             name: `Sermon (failed): ${clip.text.slice(0, 30)}...`,
             type: "sermon_clip",
             script: clip.text,
@@ -3315,9 +3377,12 @@ async function processBatch(batchId: string, body: any) {
         renameSync(withHookPath, outPath);
       }
 
+      await applyClientBranding(body.clientId, outPath);
+
       db.insert(project)
         .values({
           id: projId,
+          clientId: body.clientId ?? null,
           name: `Batch: ${clip.text.slice(0, 40)}...`,
           type: body.templateId,
           script: clip.text,
@@ -3920,6 +3985,7 @@ async function renderVideo(renderId: string, proj: any, settings: any) {
       ]);
     }
 
+    await applyClientBranding(proj.clientId, outPath);
     updateRender({ status: "done", outputPath: outPath });
     updateProject("done");
   } catch (err: any) {

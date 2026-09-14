@@ -544,6 +544,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            clientId: selectedProjectClientId() || undefined,
             // Uploaded file takes priority over a pasted URL, matching
             // the API's precedence rule.
             url: localFilePath ? undefined : fields.url,
@@ -622,6 +623,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            clientId: selectedProjectClientId() || undefined,
             url: fields.url,
             templateId: "sermon_clip",
             clipCount: settings.clipCount,
@@ -663,6 +665,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            clientId: selectedProjectClientId() || undefined,
             url: fields.url,
             templateId: "podcast_clip",
             clipCount: settings.clipCount,

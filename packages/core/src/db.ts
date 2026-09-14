@@ -15,6 +15,7 @@ export const client = sqliteTable("client", {
   id: text("id").primaryKey(),
   name: text("name").notNull(), // e.g. "Grace Community Church"
   notes: text("notes"), // contact info, contract terms, whatever's useful
+  branding: text("branding", { mode: "json" }).$type<{ logoUrl: string; logoPath: string; position: "top-left" | "top-right" | "bottom-left" | "bottom-right"; opacity: number }>(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -191,6 +192,12 @@ sqlite.exec(`
     created_at INTEGER NOT NULL
   );
 `);
+
+// Migration: add client_id to an existing project table that predates
+{
+  const cols = sqlite.query("PRAGMA table_info(client)").all() as { name: string }[];
+  if (!cols.some(c => c.name === "branding")) sqlite.exec("ALTER TABLE client ADD COLUMN branding TEXT");
+}
 
 // Migration: add client_id to an existing project table that predates
 // the client feature. CREATE TABLE IF NOT EXISTS above only helps on a

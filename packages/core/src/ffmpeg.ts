@@ -16,6 +16,24 @@ export interface ClipOpts {
   output: string;
 }
 
+export async function overlayWatermark(input: string, output: string, branding: {
+  logoPath: string;
+  position: "top-left" | "top-right" | "bottom-left" | "bottom-right";
+  opacity: number;
+}): Promise<string> {
+  const positions = {
+    "top-left": "20:20", "top-right": "main_w-overlay_w-20:20",
+    "bottom-left": "20:main_h-overlay_h-20", "bottom-right": "main_w-overlay_w-20:main_h-overlay_h-20",
+  };
+  if (!positions[branding.position] || !Number.isFinite(branding.opacity) || branding.opacity < 0 || branding.opacity > 1) {
+    throw new Error("Invalid watermark position or opacity (expected 0–1).");
+  }
+  await run(["-i", input, "-loop", "1", "-i", branding.logoPath,
+    "-filter_complex", `[1:v]scale=160:160:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa=${branding.opacity}[logo];[0:v][logo]overlay=${positions[branding.position]}:shortest=1[v]`,
+    "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", output]);
+  return output;
+}
+
 export interface TextOverlay {
   text: string;
   startMs: number;
