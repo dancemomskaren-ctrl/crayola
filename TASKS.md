@@ -19,7 +19,7 @@ Work through these in order. One task at a time. Commit after each.
 
 ## PHASE 2 — Autonomous Research Agent
 
-- [ ] **competitor-scraper:** Create `scripts/research-competitors.ts`. It should fetch and parse these URLs: https://opus.pro, https://descript.com, https://submagic.co — extract feature lists, pricing, and any mention of "church" or "sermon". Save results to `data/research/competitors-<date>.json`. Run with `bun scripts/research-competitors.ts`.
+- [x] **competitor-scraper:** Create `scripts/research-competitors.ts`. It should fetch and parse these URLs: https://opus.pro, https://descript.com, https://submagic.co — extract feature lists, pricing, and any mention of "church" or "sermon". Save results to `data/research/competitors-<date>.json`. Run with `bun scripts/research-competitors.ts`.
 
 - [ ] **trending-church-content:** Create `scripts/research-trends.ts`. Use YouTube RSS feeds (no API key needed) to pull top 20 trending videos from church channels: https://www.youtube.com/@TD_Jakes, https://www.youtube.com/@StevenFurtick, https://www.youtube.com/@elevation_church. Extract video titles, view counts, and description snippets. Save to `data/research/church-trends-<date>.json`.
 
