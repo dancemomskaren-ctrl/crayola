@@ -7,7 +7,7 @@ Work through these in order. One task at a time. Commit after each.
 
 - [ ] **sermon-scoring-v2:** Rewrite `detectHighlights()` in `packages/ai/src/index.ts` to score clips using church-specific signals: scripture references (book names, chapter:verse patterns), altar call language ("come forward", "repeat after me", "raise your hand"), testimony language ("I was", "God healed", "before I knew Christ"), and emotional peaks (audience laughter/applause markers in transcript). Weight these higher than generic hook words.
 
-- [ ] **christian-clip-titles:** In `packages/ai/src/index.ts`, add `generateChristianClipTitle(text: string, apiKey: string, apiBase: string): Promise<string>` that uses the LLM to generate a short viral-ready clip title for church social media (e.g. "Pastor's 30-second testimony will wreck you 😭"). Wire it up in the `/api/auto-clip` route so each clip gets a `suggestedTitle`.
+- [x] **christian-clip-titles:** In `packages/ai/src/index.ts`, add `generateChristianClipTitle(text: string, apiKey: string, apiBase: string): Promise<string>` that uses the LLM to generate a short viral-ready clip title for church social media (e.g. "Pastor's 30-second testimony will wreck you 😭"). Wire it up in the `/api/auto-clip` route so each clip gets a `suggestedTitle`.
 
 - [ ] **sermon-template-upgrade:** In `packages/core/src/templates.ts`, add 3 new sermon clip caption styles: `"scripture"` (bold gold text, dark bg, reference shown below), `"testimony"` (handwritten-feel font, warm tone), `"altar-call"` (urgent red/white, pulsing animation class). Add these as options to the sermon_clip template fields.
 

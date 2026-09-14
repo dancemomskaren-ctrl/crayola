@@ -757,12 +757,15 @@ app.post("/api/auto-clip", async (c) => {
     );
   }
 
-  const { autoClip, detectFaces } = await import("@crayo/ai");
+  const { autoClip, detectFaces, generateChristianClipTitle } = await import("@crayo/ai");
   const { ASPECTS, QUALITY, ffmpeg, writeASS } = await import(
     "@crayo/core"
   );
 
   try {
+    const apiKey = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
+    if (!apiKey) throw new Error("API key required for clip titles. Set DEEPSEEK_API_KEY or OPENAI_API_KEY.");
+    const apiBase = process.env.DEEPSEEK_API_BASE || (process.env.DEEPSEEK_API_KEY ? "https://api.deepseek.com" : "https://api.openai.com");
     const result = await autoClip({
       url: hasUrl ? body.url : undefined,
       localFilePath: hasLocalFile ? body.localFilePath : undefined,
@@ -774,6 +777,10 @@ app.post("/api/auto-clip", async (c) => {
 
     if (result.clips.length === 0) {
       return c.json({ error: "No highlights detected" }, 400);
+    }
+
+    for (const clip of result.clips) {
+      clip.suggestedTitle = await generateChristianClipTitle(clip.text, apiKey, apiBase);
     }
 
     // Resolve settings
@@ -993,7 +1000,7 @@ app.post("/api/auto-clip", async (c) => {
         db.insert(project)
           .values({
             id: projId,
-            name: `Auto-clip: ${clip.text.slice(0, 40)}...`,
+            name: clip.suggestedTitle!,
             type: "story",
             script: clip.text,
             createdAt: new Date(),
@@ -1011,6 +1018,7 @@ app.post("/api/auto-clip", async (c) => {
               startMs: clip.startMs,
               endMs: clip.endMs,
               score: clip.score,
+              suggestedTitle: clip.suggestedTitle,
               sourceUrl: hasUrl ? body.url : undefined,
               sourceUpload: hasLocalFile ? body.localFilePath : undefined,
             }),
@@ -1025,6 +1033,7 @@ app.post("/api/auto-clip", async (c) => {
           startMs: clip.startMs,
           endMs: clip.endMs,
           score: clip.score,
+          suggestedTitle: clip.suggestedTitle,
         });
 
         // Cleanup temp files
@@ -1041,7 +1050,7 @@ app.post("/api/auto-clip", async (c) => {
         db.insert(project)
           .values({
             id: projId,
-            name: `Auto-clip: ${clip.text.slice(0, 40)}...`,
+            name: clip.suggestedTitle!,
             type: "story",
             script: clip.text,
             createdAt: new Date(),
@@ -1058,6 +1067,7 @@ app.post("/api/auto-clip", async (c) => {
               startMs: clip.startMs,
               endMs: clip.endMs,
               score: clip.score,
+              suggestedTitle: clip.suggestedTitle,
               sourceUrl: hasUrl ? body.url : undefined,
               sourceUpload: hasLocalFile ? body.localFilePath : undefined,
             }),
@@ -1072,6 +1082,7 @@ app.post("/api/auto-clip", async (c) => {
           startMs: clip.startMs,
           endMs: clip.endMs,
           score: clip.score,
+          suggestedTitle: clip.suggestedTitle,
         });
       }
     }
