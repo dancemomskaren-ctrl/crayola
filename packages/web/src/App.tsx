@@ -191,6 +191,7 @@ export default function App() {
 
   // Auto clip results
   const [autoClips, setAutoClips] = useSignal<any[]>([]);
+  const [downloadBatchId, setDownloadBatchId] = useSignal<string | null>(null);
   const [autoClipLoading, setAutoClipLoading] = useSignal(false);
 
   // Auto clip: local mp4 upload (alternative to pasting a URL)
@@ -562,6 +563,7 @@ export default function App() {
         }
         const acData = await acRes.json();
         setAutoClips(acData.clips);
+        setDownloadBatchId(acData.batchId);
         toast(`Found ${acData.clips.length} highlight clips`, "ok");
         // Refresh project list
         const pRes = await fetch(`${API}/projects`);
@@ -605,6 +607,7 @@ export default function App() {
           throw new Error(err.error || "Standup clip failed");
         }
         const scData = await scRes.json();
+        setDownloadBatchId(null);
         setAutoClips(scData.clips.map((c: any) => ({ ...c, template: "standup" })));
         toast(`Found ${scData.clips.length} comedy highlight clips`, "ok");
         const pRes2 = await fetch(`${API}/projects`);
@@ -872,6 +875,7 @@ export default function App() {
           clearInterval(batchPollId!);
           batchPollId = null;
           setAutoClips(data.clips ?? []);
+          setDownloadBatchId(id);
           setBatchId(null);
           setBatchStatus(null);
           toast(
@@ -1858,6 +1862,9 @@ export default function App() {
                   : "Auto-Clip Results"}{" "}
               ({autoClips().length} clips)
             </h2>
+            <Show when={downloadBatchId()}>
+              <a class="inline-block mb-4 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500" href={`${API}/renders/batch/${downloadBatchId()}/zip`} download>Download All as ZIP</a>
+            </Show>
             <div class="space-y-3">
               <For each={autoClips()}>
                 {(clip) => (

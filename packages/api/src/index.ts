@@ -14,6 +14,7 @@ import {
 import { eq } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { join } from "path";
+import { tmpdir } from "os";
 import {
   mkdirSync,
   existsSync,
@@ -58,6 +59,49 @@ if (!existsSync(DELIVERY_DIR)) mkdirSync(DELIVERY_DIR, { recursive: true });
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB — covers a full-length standup special/sermon/podcast at decent bitrate
 
 app.get("/api/health", (c) => c.json({ ok: true }));
+
+app.get("/api/renders/batch/:batchId/zip", async (c) => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("batchId"))).get();
+  if (!row) return c.json({ error: "Batch not found" }, 404);
+  if (row.status !== "done") return c.json({ error: "Wait for the batch to finish before downloading." }, 409);
+  const clips = JSON.parse(row.resultJson || "[]") as { renderId: string }[];
+  const paths: string[] = [];
+  for (const clip of clips) {
+    const item = db.select().from(render).where(eq(render.id, clip.renderId)).get();
+    if (!item || item.status !== "done" || !item.outputPath || !existsSync(item.outputPath)) {
+      return c.json({ error: "A clip is unavailable. Render the batch again before downloading." }, 409);
+    }
+    paths.push(item.outputPath);
+  }
+  if (!paths.length) return c.json({ error: "This batch has no completed clips." }, 404);
+  const archive = join(tmpdir(), `crayola-${randomUUID()}.zip`);
+  const cleanup = () => { if (existsSync(archive)) unlinkSync(archive); };
+  try {
+    const proc = Bun.spawn(["zip", "-j", "-q", archive, "--", ...paths], { stdout: "ignore", stderr: "pipe" });
+    const error = await new Response(proc.stderr).text();
+    if (await proc.exited !== 0) throw new Error(`ZIP creation failed: ${error.slice(-300)}`);
+    const file = Bun.file(archive);
+    const size = file.size;
+    const reader = file.stream().getReader();
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) { cleanup(); controller.close(); }
+          else controller.enqueue(value);
+        } catch (error) { cleanup(); controller.error(error); }
+      },
+      async cancel() { try { await reader.cancel(); } finally { cleanup(); } },
+    });
+    return new Response(stream, { headers: {
+      "Content-Type": "application/zip", "Content-Length": String(size),
+      "Content-Disposition": `attachment; filename="crayola-clips.zip"`,
+    } });
+  } catch (err: any) {
+    cleanup();
+    return c.json({ error: `Unable to create ZIP. Ensure zip is installed. ${err.message}` }, 500);
+  }
+});
 
 // ─── Upload: local mp4 → usable file path for auto-clip ───
 
@@ -1145,7 +1189,9 @@ app.post("/api/auto-clip", async (c) => {
       }
     }
 
-    return c.json({ clips: projects });
+    const batchId = randomUUID();
+    db.insert(batch).values({ id: batchId, url: body.url || body.localFilePath, templateId: "auto_clip", status: "done", totalClips: projects.length, completedClips: projects.length, resultJson: JSON.stringify(projects), createdAt: new Date() }).run();
+    return c.json({ batchId, clips: projects });
   } catch (err: any) {
     return c.json({ error: err.message }, 500);
   }

@@ -13,7 +13,7 @@ Work through these in order. One task at a time. Commit after each.
 
 - [x] **church-branding-watermark:** Add a watermark/logo overlay to rendered sermon clips. API route: `POST /api/clients/:id/branding` accepts `{ logoUrl: string, position: "top-left"|"top-right"|"bottom-left"|"bottom-right", opacity: number }`. Store in client DB record. Apply watermark in FFmpeg render pipeline when client has branding set.
 
-- [ ] **multi-clip-export:** After auto-clip runs, add a "Download All as ZIP" button in the UI (`packages/web/src/App.tsx`). Backend: `GET /api/renders/batch/:batchId/zip` — use `archiver` or shell `zip` to bundle all clips in a batch into a single download.
+- [x] **multi-clip-export:** After auto-clip runs, add a "Download All as ZIP" button in the UI (`packages/web/src/App.tsx`). Backend: `GET /api/renders/batch/:batchId/zip` — use `archiver` or shell `zip` to bundle all clips in a batch into a single download.
 
 ---
 
