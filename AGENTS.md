@@ -91,7 +91,16 @@ Never commit with a failing check. Never mark a task done without a passing veri
 
 ## Model lane
 
-Work on the default cheap lane. Model selection is a CLI-level flag, not something this file can change mid-run. If a task has failed verification twice, **stop and report** — a human decides whether to escalate to a stronger model. Do not keep retrying the same failure, and do not silently escalate.
+This account runs Codex on a **ChatGPT subscription**, defaulting to `gpt-6-astra`.
+
+Do **not** pass `-m gpt-6-luna` or `-m gpt-6-sol`. Verified 2026-09-24: they are
+rejected with `400: The 'gpt-6-luna' model is not supported when using Codex with a
+ChatGPT account`, and the CLI warns `Model metadata not found`. Those lanes require
+API-key auth. Use the default model.
+
+Model selection is a CLI-level flag, not something this file can change mid-run. If a
+task has failed verification twice, **stop and report** — do not keep retrying the same
+failure, and do not silently switch models.
 
 ## Stop and summarize when
 - two verified failures on one task
