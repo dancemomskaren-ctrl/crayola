@@ -1,0 +1,94 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Verify (typecheck + test)",
+      "detail": "Runs the real gates and prints both exit codes. GREEN = safe to commit.",
+      "type": "shell",
+      "command": "./scripts/verify.sh",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify: typecheck only",
+      "type": "shell",
+      "command": "bun run typecheck > ${TMPDIR}/crayola-tc.log 2>&1; echo \"TYPECHECK EXIT: $?\"; tail -20 ${TMPDIR}/crayola-tc.log",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify: test only",
+      "type": "shell",
+      "command": "bun run test > ${TMPDIR}/crayola-test.log 2>&1; echo \"TEST EXIT: $?\"; tail -30 ${TMPDIR}/crayola-test.log",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Codex: run next task",
+      "detail": "Runs the TASKS.md loop on the default model, per AGENTS.md rules.",
+      "type": "shell",
+      "command": "codex exec --approve-for-me \"Read AGENTS.md and TASKS.md. Implement the first unfinished task. Verify with ./scripts/verify.sh — it must print GREEN before you commit. Stage explicitly as AGENTS.md says, then commit. If a task fails verification twice, stop and record the blocker in TASKS.md instead of retrying.\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: API",
+      "type": "shell",
+      "command": "bun run dev:api",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Web",
+      "type": "shell",
+      "command": "bun run dev:web",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
