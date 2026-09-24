@@ -4,7 +4,7 @@ import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
 import { join } from "path";
 import { mkdirSync, existsSync } from "fs";
 
-const DATA_DIR = join(import.meta.dir, "../../../data");
+const DATA_DIR = process.env.CRAYO_DATA_DIR || join(import.meta.dir, "../../../data");
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
 const DB_PATH = join(DATA_DIR, "crayo.db");
@@ -69,6 +69,8 @@ export const batch = sqliteTable("batch", {
   completedClips: integer("completed_clips").notNull().default(0),
   error: text("error"),
   resultJson: text("result_json"), // JSON string — array of { projectId, renderId, text, ... }
+  payloadJson: text("payload_json"),
+  analysisJson: text("analysis_json"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -192,6 +194,12 @@ sqlite.exec(`
     created_at INTEGER NOT NULL
   );
 `);
+
+// Migration: add client_id to an existing project table that predates
+for (const column of ["payload_json", "analysis_json"]) {
+  const cols = sqlite.query("PRAGMA table_info(batch)").all() as { name: string }[];
+  if (!cols.some(c => c.name === column)) sqlite.exec(`ALTER TABLE batch ADD COLUMN ${column} TEXT`);
+}
 
 // Migration: add client_id to an existing project table that predates
 {

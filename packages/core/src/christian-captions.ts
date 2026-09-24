@@ -13,10 +13,10 @@ export const CHRISTIAN_CAPTION_STYLES: Record<string, ASSStyle> = {
     name: "HolyGlow",
     fontname: "Arial",
     fontsize: 54,
-    primaryColor: 0x00FFFFFF, // white
-    secondaryColor: 0x0000AAFF, // gold
-    outlineColor: 0x0000AAFF, // gold outline
-    shadowColor: 0x0000AAFF, // gold shadow
+    primaryColor: "&H00FFFFFF&", // white
+    secondaryColor: "&H0000AAFF&", // gold
+    outlineColor: "&H0000AAFF&", // gold outline
+    shadowColor: "&H0000AAFF&", // gold shadow
     bold: 1,
     italic: 0,
     outline: 3,
@@ -33,10 +33,10 @@ export const CHRISTIAN_CAPTION_STYLES: Record<string, ASSStyle> = {
     name: "CrossBold",
     fontname: "Arial Black",
     fontsize: 58,
-    primaryColor: 0x00000000, // black
-    secondaryColor: 0x00FFFFFF, // white
-    outlineColor: 0x00FFFFFF, // white thick outline
-    shadowColor: 0x00808080, // gray shadow
+    primaryColor: "&H00000000&", // black
+    secondaryColor: "&H00FFFFFF&", // white
+    outlineColor: "&H00FFFFFF&", // white thick outline
+    shadowColor: "&H00808080&", // gray shadow
     bold: 1,
     italic: 0,
     outline: 5, // thick for visibility
@@ -53,10 +53,10 @@ export const CHRISTIAN_CAPTION_STYLES: Record<string, ASSStyle> = {
     name: "WorshipPurple",
     fontname: "Georgia",
     fontsize: 52,
-    primaryColor: 0x00FFFFFF, // white text
-    secondaryColor: 0x00800080, // purple
-    outlineColor: 0x00800080, // deep purple outline
-    shadowColor: 0x004B0082, // indigo shadow
+    primaryColor: "&H00FFFFFF&", // white text
+    secondaryColor: "&H00800080&", // purple
+    outlineColor: "&H00800080&", // deep purple outline
+    shadowColor: "&H004B0082&", // indigo shadow
     bold: 1,
     italic: 1, // slight italic for elegance
     outline: 4,
@@ -73,10 +73,10 @@ export const CHRISTIAN_CAPTION_STYLES: Record<string, ASSStyle> = {
     name: "ScriptureSerif",
     fontname: "Times New Roman",
     fontsize: 48,
-    primaryColor: 0x00F5F5DC, // beige/cream
-    secondaryColor: 0x008B4513, // saddle brown
-    outlineColor: 0x008B4513, // brown outline
-    shadowColor: 0x00000000, // black shadow
+    primaryColor: "&H00F5F5DC&", // beige/cream
+    secondaryColor: "&H008B4513&", // saddle brown
+    outlineColor: "&H008B4513&", // brown outline
+    shadowColor: "&H00000000&", // black shadow
     bold: 1,
     italic: 1,
     outline: 2,
@@ -93,10 +93,10 @@ export const CHRISTIAN_CAPTION_STYLES: Record<string, ASSStyle> = {
     name: "FireRevival",
     fontname: "Impact",
     fontsize: 60,
-    primaryColor: 0x00FFFFFF, // white
-    secondaryColor: 0x000000FF, // red
-    outlineColor: 0x000047FF, // orange-red outline
-    shadowColor: 0x00000000, // black shadow
+    primaryColor: "&H00FFFFFF&", // white
+    secondaryColor: "&H000000FF&", // red
+    outlineColor: "&H000047FF&", // orange-red outline
+    shadowColor: "&H00000000&", // black shadow
     bold: 1,
     italic: 0,
     outline: 4,

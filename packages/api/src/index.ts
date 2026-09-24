@@ -1,4 +1,7 @@
 import { Hono } from "hono";
+import { validateClipOptions } from "@crayo/ai";
+import { ROOT, OUTPUT_DIR, ASSETS_DIR, UPLOADS_DIR, DELIVERY_DIR, managedPath, sourceOptions, serial, mediaResponse } from "./local-safety";
+import { drainClipQueue, recoverJobs, validateReview, cleanupAnalysis } from "./clip-worker";
 import { cors } from "hono/cors";
 import {
   db,
@@ -26,7 +29,15 @@ import {
 } from "fs";
 
 const app = new Hono();
-app.use("/*", cors());
+const allowedOrigins = new Set(["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3001", "http://127.0.0.1:3001"]);
+app.use("/*", async (c, next) => {
+  const host = new URL(c.req.url).hostname;
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(host)) return c.json({ error: "This release is for local use only." }, 403);
+  const origin = c.req.header("Origin");
+  if (origin && !allowedOrigins.has(origin)) return c.json({ error: "Origin not allowed." }, 403);
+  await next();
+});
+app.use("/*", cors({ origin: origin => allowedOrigins.has(origin) ? origin : "", credentials: true }));
 
 // ─── API Key Auth (opt-in) ───
 // Off by default so a solo/localhost setup keeps working with zero
@@ -36,10 +47,22 @@ app.use("/*", cors());
 // this server. /api/health is always open so uptime checks don't need
 // the key.
 const API_KEY = process.env.CRAYO_API_KEY;
+const sessions = new Set<string>();
+app.post("/api/session", async c => {
+  const { key } = await c.req.json();
+  if (!API_KEY || key !== API_KEY) return c.json({ error: "Incorrect local API key." }, 401);
+  const token = randomUUID();
+  if (sessions.size > 100) sessions.clear();
+  sessions.add(token);
+  c.header("Set-Cookie", `crayo_session=${token}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800`);
+  return c.json({ ok: true });
+});
 if (API_KEY) {
   const { bearerAuth } = await import("hono/bearer-auth");
   app.use("/api/*", async (c, next) => {
     if (c.req.path === "/api/health") return next();
+    const token = c.req.header("Cookie")?.split(";").map(s => s.trim()).find(s => s.startsWith("crayo_session="))?.split("=")[1];
+    if (token && sessions.has(token)) return next();
     return bearerAuth({ token: API_KEY })(c, next);
   });
   console.log("CRAYO_API_KEY is set — all /api/* routes require Bearer auth (except /api/health).");
@@ -47,27 +70,54 @@ if (API_KEY) {
   console.log("CRAYO_API_KEY not set — API is open, no auth required. Set it before exposing this server beyond your own machine.");
 }
 
-const ROOT = join(import.meta.dir, "../../..");
-const OUTPUT_DIR = join(ROOT, "data/renders");
-const ASSETS_DIR = join(ROOT, "assets");
-const UPLOADS_DIR = join(ROOT, "data/uploads");
-const DELIVERY_DIR = join(ROOT, "data/delivery");
 if (!existsSync(OUTPUT_DIR)) mkdirSync(OUTPUT_DIR, { recursive: true });
 if (!existsSync(UPLOADS_DIR)) mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!existsSync(DELIVERY_DIR)) mkdirSync(DELIVERY_DIR, { recursive: true });
 
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB — covers a full-length standup special/sermon/podcast at decent bitrate
 
-app.get("/api/health", (c) => c.json({ ok: true }));
+app.get("/api/health", (c) => c.json({ ok: true, authRequired: !!API_KEY, mode: "local" }));
+
+// Validate every caller-supplied processing path before a handler can touch it.
+app.use("/api/*", async (c, next) => {
+  if (c.req.method === "POST" && c.req.header("content-type")?.includes("application/json")) {
+    try {
+      const raw = await c.req.text();
+      const body = raw ? JSON.parse(raw) : {};
+      const inspect = (obj: any): void => {
+        if (!obj || typeof obj !== "object") return;
+        for (const [key, value] of Object.entries(obj)) {
+          if (["inputPath", "localFilePath", "audioFile", "videoPath", "mainVideo", "backgroundVideo", "thumbnail", "path"].includes(key) && typeof value === "string") obj[key] = managedPath(value);
+          if (["outputPath", "outputDir"].includes(key) && typeof value === "string") obj[key] = managedPath(value, true);
+          if (key === "sourceVideos" && Array.isArray(value)) obj[key] = value.map(path => managedPath(String(path)));
+          if (typeof value === "object") inspect(value);
+        }
+      };
+      inspect(body);
+      if (typeof body.url === "string" && body.url) {
+        if (c.req.path === "/api/reddit") {
+          const url = new URL(body.url);
+          if (url.protocol !== "https:" || !["reddit.com", "www.reddit.com", "old.reddit.com"].includes(url.hostname)) throw new Error("Use an HTTPS Reddit link.");
+        } else if (/^https?:/.test(body.url)) sourceOptions({ url: body.url });
+        else body.url = managedPath(body.url);
+      }
+      // Handlers must consume the normalized paths, not the unchecked originals.
+      c.req.bodyCache.json = Promise.resolve(body);
+    } catch (error: any) { return c.json({ error: error.message }, 400); }
+  }
+  const immediateMedia = new Set(["/api/music-edit", "/api/standup-clip", "/api/reaction", "/api/top-list", "/api/tts", "/api/stt", "/api/remove-bg", "/api/audio/remove-vocals", "/api/audio/enhance", "/api/download", "/api/remove-silence", "/api/stem-analysis", "/api/silence-detect", "/api/silence-remove", "/api/reframe", "/api/speech-enhance", "/api/split-screen", "/api/batch-render"]);
+  if (c.req.method === "POST" && immediateMedia.has(c.req.path)) await serial(next);
+  else await next();
+});
 
 app.get("/api/renders/batch/:batchId/zip", async (c) => {
   const row = db.select().from(batch).where(eq(batch.id, c.req.param("batchId"))).get();
   if (!row) return c.json({ error: "Batch not found" }, 404);
-  if (row.status !== "done") return c.json({ error: "Wait for the batch to finish before downloading." }, 409);
-  const clips = JSON.parse(row.resultJson || "[]") as { renderId: string }[];
+  if (!["done", "partial", "error", "interrupted"].includes(row.status)) return c.json({ error: "Wait for the batch to finish before downloading." }, 409);
+  const clips = (JSON.parse(row.resultJson || "[]") as { renderId?: string; error?: string }[]).filter(c => c.renderId && !c.error);
   const paths: string[] = [];
   for (const clip of clips) {
-    const item = db.select().from(render).where(eq(render.id, clip.renderId)).get();
+    const item = db.select().from(render).where(eq(render.id, clip.renderId!)).get();
     if (!item || item.status !== "done" || !item.outputPath || !existsSync(item.outputPath)) {
       return c.json({ error: "A clip is unavailable. Render the batch again before downloading." }, 409);
     }
@@ -116,7 +166,7 @@ app.post("/api/upload", async (c) => {
   }
   if (file.size > MAX_UPLOAD_BYTES) {
     return c.json(
-      { error: `file too large (${(file.size / 1e9).toFixed(2)}GB, max 2GB)` },
+      { error: `file too large (${(file.size / 1e9).toFixed(2)}GB, max 4GB)` },
       400,
     );
   }
@@ -134,44 +184,34 @@ app.post("/api/upload", async (c) => {
 // none. This is intentionally simple: no auth-scoping per client here,
 // just a tag for organizing and filtering your own work.
 
-app.post("/api/clients/:id/branding", async (c) => {
+app.post("/api/clients/:id/branding", async c => {
   const id = c.req.param("id");
   if (!db.select().from(client).where(eq(client.id, id)).get()) return c.json({ error: "Client not found" }, 404);
-  const body = await c.req.json();
-  if (!body || typeof body.logoUrl !== "string" || !["top-left", "top-right", "bottom-left", "bottom-right"].includes(body.position) || typeof body.opacity !== "number" || !Number.isFinite(body.opacity) || body.opacity < 0 || body.opacity > 1) {
-    return c.json({ error: "Provide logoUrl, a valid corner position, and opacity between 0 and 1." }, 400);
-  }
-  try {
-    const url = new URL(body.logoUrl);
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("Invalid URL");
-  } catch { return c.json({ error: "logoUrl must be an HTTP or HTTPS URL without credentials." }, 400); }
+  if (!c.req.header("content-type")?.includes("multipart/form-data")) return c.json({ error: "Upload a logo image as multipart field logo. Remote logo fetching is disabled." }, 400);
+  const body = await c.req.parseBody();
+  const logo = body.logo;
+  const position = String(body.position ?? "bottom-right");
+  const opacity = Number(body.opacity ?? 0.8);
+  if (!(logo instanceof File) || !["image/png", "image/jpeg", "image/webp"].includes(logo.type) || logo.size > 5 * 1024 * 1024 ||
+      !["top-left", "top-right", "bottom-left", "bottom-right"].includes(position) || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) return c.json({ error: "Upload a PNG, JPG or WebP under 5MB, with a corner position and opacity from 0 to 1." }, 400);
   const logoPath = join(UPLOADS_DIR, `${randomUUID()}-logo.png`);
   const sourcePath = `${logoPath}.source`;
   try {
-    const response = await fetch(body.logoUrl, { signal: AbortSignal.timeout(15_000) });
-    if (!response.ok || !response.headers.get("content-type")?.startsWith("image/")) throw new Error("Logo URL must return an image.");
-    const reader = response.body!.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.length;
-        if (size > 5 * 1024 * 1024) throw new Error("Logo must be smaller than 5 MB.");
-        chunks.push(value);
-      }
-    } finally { await reader.cancel(); }
-    await Bun.write(sourcePath, new Blob(chunks));
+    await Bun.write(sourcePath, logo);
     const { ffmpeg } = await import("@crayo/core");
-    await ffmpeg.run(["-i", sourcePath, "-frames:v", "1", "-vf", "scale=512:512:force_original_aspect_ratio=decrease", logoPath]);
-    const branding = { logoUrl: body.logoUrl, logoPath, position: body.position, opacity: body.opacity };
+    await serial(() => ffmpeg.run(["-i", sourcePath, "-frames:v", "1", "-vf", "scale=512:512:force_original_aspect_ratio=decrease", logoPath]));
+    const branding = { logoPath, logoUrl: `/api/clients/${id}/logo`, position: position as "bottom-right", opacity };
     db.update(client).set({ branding }).where(eq(client.id, id)).run();
-    return c.json({ logoUrl: branding.logoUrl, position: branding.position, opacity: branding.opacity });
-  } catch (err: any) {
+    return c.json({ ok: true, logoUrl: branding.logoUrl, position, opacity });
+  } catch (error: any) {
     if (existsSync(logoPath)) unlinkSync(logoPath);
-    return c.json({ error: `Unable to save branding: ${err.message}` }, 400);
+    return c.json({ error: error.message }, 400);
   } finally { if (existsSync(sourcePath)) unlinkSync(sourcePath); }
+});
+app.get("/api/clients/:id/logo", c => {
+  const row = db.select().from(client).where(eq(client.id, c.req.param("id"))).get();
+  if (!row?.branding || !existsSync(row.branding.logoPath)) return c.json({ error: "No logo" }, 404);
+  return new Response(Bun.file(managedPath(row.branding.logoPath)), { headers: { "Content-Type": "image/png" } });
 });
 
 async function applyClientBranding(clientId: string | undefined | null, path: string) {
@@ -438,7 +478,7 @@ app.post("/api/renders", async (c) => {
     })
     .run();
 
-  renderVideo(id, proj, body.settings ?? {}).catch(console.error);
+  void serial(() => renderVideo(id, proj, body.settings ?? {})).catch(console.error);
 
   return c.json({ id });
 });
@@ -462,13 +502,7 @@ app.get("/api/renders/:id/download", async (c) => {
   if (!row || !row.outputPath) return c.json({ error: "not ready" }, 404);
   if (!existsSync(row.outputPath))
     return c.json({ error: "file missing" }, 404);
-  const file = Bun.file(row.outputPath);
-  return new Response(file, {
-    headers: {
-      "Content-Type": "video/mp4",
-      "Content-Disposition": `attachment; filename="crayo-${row.id}.mp4"`,
-    },
-  });
+  return mediaResponse(managedPath(row.outputPath), c.req.header("Range"), `crayo-${row.id}.mp4`);
 });
 
 app.delete("/api/renders/:id", async (c) => {
@@ -551,7 +585,6 @@ app.post("/api/generate-script", async (c) => {
       style: body.style,
       duration: body.duration,
       platform: body.platform,
-      ragebaitHook,
     });
     return c.json(script);
   } catch (err: any) {
@@ -694,54 +727,7 @@ app.delete("/api/post-queue/:id", async (c) => {
 
 // ─── Post Now ───
 
-app.post("/api/post-now", async (c) => {
-  const body = await c.req.json();
-  if (!body.renderId || typeof body.renderId !== "string") {
-    return c.json({ error: "renderId is required" }, 400);
-  }
-  if (!body.platform || typeof body.platform !== "string") {
-    return c.json({ error: "platform is required" }, 400);
-  }
-
-  // Get the render to find the video file
-  const renderRow = db
-    .select()
-    .from(render)
-    .where(eq(render.id, body.renderId))
-    .get();
-  if (!renderRow) return c.json({ error: "render not found" }, 404);
-  if (!renderRow.outputPath)
-    return c.json({ error: "render has no output" }, 400);
-
-  // In a real implementation, this would call the platform's API:
-  // - Instagram Graph API for Reels
-  // - TikTok API for videos
-  // - YouTube Data API for Shorts
-  // For now, we just mark it as posted with a placeholder URL
-
-  const id = randomUUID();
-  const postUrl = `https://${body.platform}.com/watch/${id.slice(0, 8)}`;
-
-  db.insert(postQueue)
-    .values({
-      id,
-      renderId: body.renderId,
-      platform: body.platform,
-      status: "posted",
-      caption: body.caption,
-      hashtags: body.hashtags ? JSON.stringify(body.hashtags) : null,
-      postedAt: new Date(),
-      postUrl,
-      createdAt: new Date(),
-    })
-    .run();
-
-  return c.json({
-    id,
-    postUrl,
-    message: `Queued for ${body.platform}. Connect platform API keys in .env to auto-post.`,
-  });
-});
+app.post("/api/post-now", c => c.json({ error: "Automatic publishing is unavailable. Download and post manually." }, 501));
 
 // ─── Phase 4: Background removal ───
 
@@ -807,14 +793,14 @@ app.post("/api/audio/enhance", async (c) => {
 // ─── Templates ───
 
 app.get("/api/templates", async (c) => {
-  const { TEMPLATES } = await import("@crayo/core");
-  return c.json(TEMPLATES);
+  const { availableTemplates } = await import("@crayo/core");
+  return c.json(availableTemplates());
 });
 
 app.get("/api/templates/:id", async (c) => {
   const { getTemplate } = await import("@crayo/core");
   const tpl = getTemplate(c.req.param("id"));
-  if (!tpl) return c.json({ error: "template not found" }, 404);
+  if (!tpl || tpl.unavailableReason) return c.json({ error: "template unavailable" }, 404);
   return c.json(tpl);
 });
 
@@ -842,1041 +828,9 @@ app.post("/api/download", async (c) => {
 
 // ─── Auto Clip: YouTube → highlight clips ───
 
-app.post("/api/auto-clip", async (c) => {
-  const body = await c.req.json();
-  const hasUrl = body.url && typeof body.url === "string";
-  const hasLocalFile =
-    body.localFilePath && typeof body.localFilePath === "string";
-  if (!hasUrl && !hasLocalFile) {
-    return c.json(
-      { error: "either url or localFilePath is required (localFilePath comes from /api/upload)" },
-      400,
-    );
-  }
-
-  const { autoClip, detectFaces, generateChristianClipTitle } = await import("@crayo/ai");
-  const { ASPECTS, QUALITY, ffmpeg, writeASS } = await import(
-    "@crayo/core"
-  );
-
-  try {
-    const apiKey = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("API key required for clip titles. Set DEEPSEEK_API_KEY or OPENAI_API_KEY.");
-    const apiBase = process.env.DEEPSEEK_API_BASE || (process.env.DEEPSEEK_API_KEY ? "https://api.deepseek.com" : "https://api.openai.com");
-    const result = await autoClip({
-      url: hasUrl ? body.url : undefined,
-      localFilePath: hasLocalFile ? body.localFilePath : undefined,
-      clipCount: Number(body.clipCount ?? 5),
-      minDuration: Number(body.minDuration ?? 15),
-      maxDuration: Number(body.maxDuration ?? 60),
-      language: body.language ?? "en",
-    });
-
-    if (result.clips.length === 0) {
-      return c.json({ error: "No highlights detected" }, 400);
-    }
-
-    for (const clip of result.clips) {
-      clip.suggestedTitle = await generateChristianClipTitle(clip.text, apiKey, apiBase);
-    }
-
-    // Resolve settings
-    const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
-    const platformKey = String(body.platform ?? "9:16");
-    const platform = validPlatforms.includes(platformKey as any)
-      ? (platformKey as keyof typeof ASPECTS)
-      : "9:16";
-    const aspect = ASPECTS[platform];
-
-    const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
-    const qualityKey = String(body.quality ?? "standard");
-    const quality = validQualities.includes(qualityKey as any)
-      ? (qualityKey as keyof typeof QUALITY)
-      : "standard";
-    const qual = QUALITY[quality];
-
-    const captionStyleName = String(body.captionStyle ?? "bold_pop");
-    // premium = 60fps motion interpolation via FFmpeg minterpolate.
-    // Off by default: it multiplies render time.
-    const usePremium = body.premium === true;
-    const bgClips = listStockClips();
-
-    const ASS_STYLES = new Set([
-      "typewriter",
-      "bounce",
-      "shake",
-      "zoom",
-      "colorful",
-      "word_by_word",
-      "glow",
-      "neon",
-    ]);
-
-    // Render each clip with captions, title, smart zoom
-    const projects: any[] = [];
-    for (let i = 0; i < result.clips.length; i++) {
-      const clip = result.clips[i];
-      const projId = randomUUID();
-      const renderId = randomUUID();
-      const clipDur = (clip.endMs - clip.startMs) / 1000;
-      const clipStartSec = clip.startMs / 1000;
-
-      try {
-        const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
-        const tempFiles: string[] = [];
-
-        // Extract clip segment from source
-        const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
-        tempFiles.push(segPath);
-        await ffmpeg.run([
-          "-y",
-          "-ss",
-          String(clipStartSec),
-          "-i",
-          result.sourcePath,
-          "-t",
-          String((clip.endMs - clip.startMs) / 1000),
-          "-c",
-          "copy",
-          segPath,
-        ]);
-
-        // Reformat to target aspect ratio (e.g. 9:16 for TikTok)
-        const fmtPath = join(OUTPUT_DIR, `${renderId}-fmt.mp4`);
-        tempFiles.push(fmtPath);
-        await ffmpeg.run([
-          "-y",
-          "-i",
-          segPath,
-          "-vf",
-          `scale=${aspect.width}:${aspect.height}:force_original_aspect_ratio=decrease,pad=${aspect.width}:${aspect.height}:(ow-iw)/2:(oh-ih)/2:black`,
-          "-c:v",
-          "libx264",
-          "-preset",
-          qual.preset,
-          "-crf",
-          String(qual.crf),
-          "-c:a",
-          "aac",
-          "-b:a",
-          "128k",
-          fmtPath,
-        ]);
-
-        // Get captions for this clip
-        const clipCaptions = clip.captions || [];
-
-        // Detect faces for smart zoom
-        let faceData: any = null;
-        if (body.smartZoom !== false) {
-          try {
-            const faceOutPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
-            tempFiles.push(faceOutPath);
-            faceData = await detectFaces({
-              inputPath: segPath,
-              outputPath: faceOutPath,
-              sampleFps: 2,
-            });
-          } catch (e) {
-            console.warn("Face detection failed:", e);
-          }
-        }
-
-        // Build background
-        let renderPath = fmtPath;
-        if (bgClips.length > 0 && body.bgVideo !== false) {
-          const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
-          tempFiles.push(bgPath);
-          const bg = bgClips[i % bgClips.length];
-          await ffmpeg.trim({ input: bg, end: clipDur + 2, output: bgPath });
-          const compositedPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
-          tempFiles.push(compositedPath);
-          await ffmpeg.composeSplitScreen(fmtPath, bg, compositedPath, {
-            bgPosition: body.bgPosition ?? "right",
-          });
-          renderPath = compositedPath;
-        }
-
-        // Generate title overlay (clickbait style)
-        const titleText = clip.suggestedTitle || clip.text.slice(0, 50) + "...";
-
-        // Route caption generation based on style
-        let vf = ""; // video filter string
-        
-        if (captionStyleName === "none") {
-          // No captions, just title
-          const titleY = Math.floor(aspect.height * 0.12);
-          vf = `drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
-        } else if (captionStyleName.startsWith("viral_")) {
-          // Viral ASS captions (MrBeast, Hormozi, etc.)
-          const { generateViralASS } = await import("@crayo/core");
-          const viralStyleId = captionStyleName.replace("viral_", ""); // e.g. "mrbeast"
-          
-          const assPath = join(OUTPUT_DIR, `${renderId}-viral.ass`);
-          tempFiles.push(assPath);
-          
-          const assContent = generateViralASS(
-            clipCaptions.map(c => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })),
-            viralStyleId,
-            aspect.width,
-            aspect.height,
-            10, // position from bottom (%)
-          );
-          
-          writeFileSync(assPath, assContent);
-          
-          // Title + viral ASS captions
-          const titleY = Math.floor(aspect.height * 0.12);
-          vf = `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
-        } else if (captionStyleName.startsWith("scattered_")) {
-          // Scattered word captions (aesthetic edit style)
-          const { buildScatteredWordFilterComplex } = await import("@crayo/core");
-          const scatteredStyleId = captionStyleName.replace("scattered_", ""); // e.g. "clean", "neon"
-          
-          const scatteredFilter = buildScatteredWordFilterComplex({
-            words: clipCaptions.map(c => ({ text: c.text, startMs: c.startMs, endMs: c.endMs })),
-            videoWidth: aspect.width,
-            videoHeight: aspect.height,
-            style: scatteredStyleId as any,
-            minFontSize: 60,
-            maxFontSize: 100,
-            safeMargin: 50,
-          });
-          
-          // Scattered words (no title needed, words are the aesthetic)
-          vf = scatteredFilter;
-        } else {
-          // Traditional ASS styles (bold_pop, typewriter, bounce, etc.)
-          const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
-          tempFiles.push(assPath);
-          writeASS(
-            clipCaptions.map((c) => ({
-              text: c.text,
-              startMs: c.startMs,
-              endMs: c.endMs,
-            })),
-            captionStyleName,
-            assPath,
-            aspect.width,
-            aspect.height,
-          );
-
-          // Title + traditional ASS captions
-          const titleY = Math.floor(aspect.height * 0.12);
-          vf = `ass=${assPath},drawtext=text='${titleText.replace(/'/g, "'\\''")}':fontsize=${Math.floor(aspect.height / 20)}:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${titleY}`;
-        }
-
-        // Render with chosen caption style.
-        // Premium mode appends FFmpeg's minterpolate filter, which
-        // synthesises in-between frames for 60fps motion. It is slow
-        // (roughly 3-5x a normal render) so it stays opt-in per request.
-        const vfChain = usePremium
-          ? `${vf},minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1`
-          : vf;
-
-        await ffmpeg.run([
-          "-y",
-          "-i",
-          renderPath,
-          "-vf",
-          vfChain,
-          "-c:v",
-          "libx264",
-          "-preset",
-          qual.preset,
-          "-crf",
-          String(qual.crf),
-          "-c:a",
-          "aac",
-          "-b:a",
-          "128k",
-          "-shortest",
-          outPath,
-        ]);
-
-        await applyClientBranding(body.clientId, outPath);
-
-        db.insert(project)
-          .values({
-            id: projId,
-            clientId: body.clientId ?? null,
-            name: clip.suggestedTitle!,
-            type: "story",
-            script: clip.text,
-            createdAt: new Date(),
-          })
-          .run();
-
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "done",
-            outputPath: outPath,
-            settings: JSON.stringify({
-              autoClip: true,
-              startMs: clip.startMs,
-              endMs: clip.endMs,
-              score: clip.score,
-              suggestedTitle: clip.suggestedTitle,
-              sourceUrl: hasUrl ? body.url : undefined,
-              sourceUpload: hasLocalFile ? body.localFilePath : undefined,
-            }),
-            createdAt: new Date(),
-          })
-          .run();
-
-        projects.push({
-          projectId: projId,
-          renderId,
-          text: clip.text,
-          startMs: clip.startMs,
-          endMs: clip.endMs,
-          score: clip.score,
-          suggestedTitle: clip.suggestedTitle,
-        });
-
-        // Cleanup temp files
-        for (const f of tempFiles) {
-          try {
-            unlinkSync(f);
-          } catch {}
-        }
-      } catch (err: any) {
-        if (body.clientId) throw err;
-        console.error(`Failed to render clip ${i}:`, err.message);
-        // Still create a project record with the raw clip as fallback
-        const projId = randomUUID();
-        const renderId = randomUUID();
-        db.insert(project)
-          .values({
-            id: projId,
-            clientId: body.clientId ?? null,
-            name: clip.suggestedTitle!,
-            type: "story",
-            script: clip.text,
-            createdAt: new Date(),
-          })
-          .run();
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "done",
-            outputPath: clip.path,
-            settings: JSON.stringify({
-              autoClip: true,
-              startMs: clip.startMs,
-              endMs: clip.endMs,
-              score: clip.score,
-              suggestedTitle: clip.suggestedTitle,
-              sourceUrl: hasUrl ? body.url : undefined,
-              sourceUpload: hasLocalFile ? body.localFilePath : undefined,
-            }),
-            createdAt: new Date(),
-          })
-          .run();
-
-        projects.push({
-          projectId: projId,
-          renderId,
-          text: clip.text,
-          startMs: clip.startMs,
-          endMs: clip.endMs,
-          score: clip.score,
-          suggestedTitle: clip.suggestedTitle,
-        });
-      }
-    }
-
-    const batchId = randomUUID();
-    db.insert(batch).values({ id: batchId, url: body.url || body.localFilePath, templateId: "auto_clip", status: "done", totalClips: projects.length, completedClips: projects.length, resultJson: JSON.stringify(projects), createdAt: new Date() }).run();
-    return c.json({ batchId, clips: projects });
-  } catch (err: any) {
-    return c.json({ error: err.message }, 500);
-  }
-});
-
-// ─── Sermon Clip: YouTube sermon → captioned highlight clips ───
-
-app.post("/api/sermon-clip", async (c) => {
-  const body = await c.req.json();
-  if (!body.url || typeof body.url !== "string") {
-    return c.json({ error: "url is required" }, 400);
-  }
-
-  try {
-    const { autoClip, speechToText } = await import("@crayo/ai");
-    const { ASPECTS, QUALITY, ffmpeg, writeASS, mixAudio } = await import(
-      "@crayo/core"
-    );
-
-    // Step 1: Download + transcribe + detect highlights
-    const result = await autoClip({
-      url: body.url,
-      clipCount: Number(body.clipCount ?? 5),
-      minDuration: Number(body.minDuration ?? 15),
-      maxDuration: Number(body.maxDuration ?? 60),
-      language: body.language ?? "en",
-    });
-
-    if (result.clips.length === 0) {
-      return c.json({ error: "No highlights detected" }, 400);
-    }
-
-    // Step 2: Transcribe full sermon for caption generation
-    const audioPath = join(OUTPUT_DIR, `.sermon-audio-${randomUUID()}.mp3`);
-    const ffmpegBin = process.env.FFMPEG_PATH || "ffmpeg";
-    const audioProc = Bun.spawn(
-      [
-        ffmpegBin,
-        "-y",
-        "-i",
-        result.sourcePath,
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-q:a",
-        "4",
-        audioPath,
-      ],
-      { stdout: "pipe", stderr: "pipe" },
-    );
-    if ((await audioProc.exited) !== 0) {
-      throw new Error("Failed to extract sermon audio");
-    }
-
-    const fullCaptions = await speechToText({
-      inputPath: audioPath,
-      language: body.language ?? "en",
-    });
-
-    // Resolve settings
-    const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
-    const platformKey = String(body.platform ?? "9:16");
-    const platform = validPlatforms.includes(platformKey as any)
-      ? (platformKey as keyof typeof ASPECTS)
-      : "9:16";
-    const aspect = ASPECTS[platform];
-
-    const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
-    const qualityKey = String(body.quality ?? "standard");
-    const quality = validQualities.includes(qualityKey as any)
-      ? (qualityKey as keyof typeof QUALITY)
-      : "standard";
-    const qual = QUALITY[quality];
-
-    const hookIntro = String(body.hookIntro ?? "Watch this...");
-    const captionStyleName = String(body.captionStyle ?? "bold_pop");
-    const transitionType = String(body.transition ?? "crossfade");
-    const bgClips = listStockClips();
-
-    const ASS_STYLES = new Set([
-      "scripture", "testimony", "altar-call",
-      "typewriter",
-      "bounce",
-      "shake",
-      "zoom",
-      "colorful",
-      "word_by_word",
-      "glow",
-      "neon",
-    ]);
-
-    // Step 3: Render each clip
-    const projects: any[] = [];
-    for (let i = 0; i < result.clips.length; i++) {
-      const clip = result.clips[i];
-      const projId = randomUUID();
-      const renderId = randomUUID();
-      const clipDur = (clip.endMs - clip.startMs) / 1000;
-      const clipStartSec = clip.startMs / 1000;
-
-      try {
-        const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
-        const tempFiles: string[] = [];
-
-        // Extract clip segment from source
-        const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
-        tempFiles.push(segPath);
-        await ffmpeg.run([
-          "-y",
-          "-ss",
-          String(clipStartSec),
-          "-i",
-          result.sourcePath,
-          "-t",
-          String(clipDur),
-          "-c",
-          "copy",
-          segPath,
-        ]);
-
-        // Get captions for this clip's time range
-        const clipCaptions = fullCaptions.filter(
-          (cap) =>
-            cap.startMs >= clip.startMs - 500 && cap.endMs <= clip.endMs + 500,
-        );
-        const relativeCaptions = clipCaptions.map((cap) => ({
-          text: cap.text,
-          startMs: Math.max(0, cap.startMs - clip.startMs),
-          endMs: Math.min(clip.endMs - clip.startMs, cap.endMs - clip.startMs),
-        }));
-        const grouped = groupCaptions(relativeCaptions, 4);
-
-        // Build background: use gameplay if available
-        let renderPath = segPath;
-        if (bgClips.length > 0 && body.bgVideo !== false) {
-          const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
-          tempFiles.push(bgPath);
-          const bg = bgClips[i % bgClips.length];
-          await ffmpeg.trim({ input: bg, end: clipDur + 2, output: bgPath });
-          const compositedPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
-          tempFiles.push(compositedPath);
-          await ffmpeg.composeSplitScreen(segPath, bg, compositedPath, {
-            bgPosition: "right",
-          });
-          renderPath = compositedPath;
-        }
-
-        // Format to aspect ratio
-        const aspectPath = join(OUTPUT_DIR, `${renderId}-aspect.mp4`);
-        tempFiles.push(aspectPath);
-        await ffmpeg.toAspect(renderPath, aspectPath, platform, quality);
-        renderPath = aspectPath;
-
-        // Smart zoom
-        if (body.smartZoom && bgClips.length > 0) {
-          try {
-            const { detectFaces } = await import("@crayo/ai");
-            const faceDataPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
-            tempFiles.push(faceDataPath);
-            await detectFaces({
-              inputPath: renderPath,
-              outputPath: faceDataPath,
-            });
-            const zoomedPath = join(OUTPUT_DIR, `${renderId}-zoomed.mp4`);
-            tempFiles.push(zoomedPath);
-            await ffmpeg.smartZoom(renderPath, {
-              faceDataPath,
-              output: zoomedPath,
-              quality,
-            });
-            renderPath = zoomedPath;
-          } catch {}
-        }
-
-        // Mix audio (sermon audio + optional bg music)
-        const voiceVol = Number(body.voiceVolume ?? 1.0);
-        const musicVol = Number(body.musicVolume ?? 0.15);
-        const hasMusic =
-          body.bgMusic !== false && listBgMusic().length > 0 && musicVol > 0;
-        if (voiceVol > 0 || hasMusic) {
-          const mixedAudioPath = join(
-            OUTPUT_DIR,
-            `${renderId}-mixed-audio.m4a`,
-          );
-          tempFiles.push(mixedAudioPath);
-          const mixedPath = join(OUTPUT_DIR, `${renderId}-mixed.mp4`);
-          tempFiles.push(mixedPath);
-
-          const tracks: any[] = [];
-          if (voiceVol > 0) {
-            tracks.push({ path: segPath, volume: voiceVol });
-          }
-          if (hasMusic) {
-            const bgMusic =
-              listBgMusic()[Math.floor(Math.random() * listBgMusic().length)];
-            tracks.push({ path: bgMusic, volume: musicVol, loop: true });
-          }
-          await mixAudio({
-            tracks,
-            sfx: [],
-            duration: clipDur,
-            output: mixedAudioPath,
-          });
-          await ffmpeg.addAudio(renderPath, mixedAudioPath, mixedPath);
-          renderPath = mixedPath;
-        }
-
-        // Apply captions
-        if (grouped.length > 0) {
-          if (ASS_STYLES.has(captionStyleName)) {
-            const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
-            tempFiles.push(assPath);
-            writeASS(
-              grouped.map((t) => ({
-                text: t.text,
-                reference: String(body.scriptureReference ?? ""),
-                startMs: t.startMs,
-                endMs: t.endMs,
-              })),
-              captionStyleName,
-              assPath,
-              aspect.width,
-              aspect.height,
-            );
-            await ffmpeg.renderASS(renderPath, assPath, outPath, quality);
-          } else {
-            const captionStyle = buildCaptionStyle(captionStyleName);
-            await ffmpeg.overlayText(
-              renderPath,
-              grouped.map((t) => ({ ...t, style: captionStyle })),
-              outPath,
-            );
-          }
-        } else {
-          // No captions — just copy
-          await ffmpeg.run(["-y", "-i", renderPath, "-c", "copy", outPath]);
-        }
-
-        // Hook intro overlay (text at the start)
-        if (hookIntro) {
-          const withHookPath = join(OUTPUT_DIR, `${renderId}-hook.mp4`);
-          tempFiles.push(withHookPath);
-          await ffmpeg.overlayText(
-            outPath,
-            [
-              {
-                text: hookIntro,
-                startMs: 0,
-                endMs: 3000,
-                style: {
-                  fontSize: 56,
-                  fontColor: "white",
-                  position: "center",
-                  outline: true,
-                  outlineColor: "black",
-                },
-              },
-            ],
-            withHookPath,
-          );
-          unlinkSync(outPath);
-          renameSync(withHookPath, outPath);
-        }
-
-        await applyClientBranding(body.clientId, outPath);
-
-        db.insert(project)
-          .values({
-            id: projId,
-            clientId: body.clientId ?? null,
-            name: `Sermon: ${clip.text.slice(0, 40)}...`,
-            type: "sermon_clip",
-            script: clip.text,
-            url: body.url,
-            createdAt: new Date(),
-          })
-          .run();
-
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "done",
-            outputPath: outPath,
-            settings: JSON.stringify({
-              sermonClip: true,
-              startMs: clip.startMs,
-              endMs: clip.endMs,
-              score: clip.score,
-              sourceUrl: body.url,
-              captionStyle: captionStyleName,
-              platform,
-              quality,
-              hookIntro,
-            }),
-            createdAt: new Date(),
-          })
-          .run();
-
-        // Store captions
-        for (const cap of grouped) {
-          db.insert(caption)
-            .values({
-              id: randomUUID(),
-              renderId,
-              text: cap.text,
-              startMs: cap.startMs + clip.startMs,
-              endMs: cap.endMs + clip.startMs,
-              style: JSON.stringify(captionStyleName),
-            })
-            .run();
-        }
-
-        // Cleanup temp files
-        for (const f of tempFiles) {
-          try {
-            unlinkSync(f);
-          } catch {}
-        }
-
-        projects.push({
-          projectId: projId,
-          renderId,
-          text: clip.text,
-          startMs: clip.startMs,
-          endMs: clip.endMs,
-          score: clip.score,
-        });
-      } catch (err: any) {
-        db.insert(project)
-          .values({
-            id: projId,
-            clientId: body.clientId ?? null,
-            name: `Sermon (failed): ${clip.text.slice(0, 30)}...`,
-            type: "sermon_clip",
-            script: clip.text,
-            url: body.url,
-            status: "error",
-            createdAt: new Date(),
-          })
-          .run();
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "error",
-            error: err.message,
-            createdAt: new Date(),
-          })
-          .run();
-      }
-    }
-
-    // Cleanup source audio
-    try {
-      unlinkSync(audioPath);
-    } catch {}
-
-    return c.json({ clips: projects });
-  } catch (err: any) {
-    return c.json({ error: err.message }, 500);
-  }
-});
-
-// ─── Podcast Clip: YouTube podcast → captioned highlight clips ───
-
-app.post("/api/podcast-clip", async (c) => {
-  const body = await c.req.json();
-  if (!body.url || typeof body.url !== "string") {
-    return c.json({ error: "url is required" }, 400);
-  }
-
-  try {
-    const { autoClip, speechToText } = await import("@crayo/ai");
-    const { ASPECTS, QUALITY, ffmpeg, writeASS, mixAudio } = await import(
-      "@crayo/core"
-    );
-
-    const result = await autoClip({
-      url: body.url,
-      clipCount: Number(body.clipCount ?? 5),
-      minDuration: Number(body.minDuration ?? 15),
-      maxDuration: Number(body.maxDuration ?? 60),
-      language: body.language ?? "en",
-    });
-
-    if (result.clips.length === 0) {
-      return c.json({ error: "No highlights detected" }, 400);
-    }
-
-    // Transcribe full audio for captions
-    const audioPath = join(OUTPUT_DIR, `.podcast-audio-${randomUUID()}.mp3`);
-    const ffmpegBin = process.env.FFMPEG_PATH || "ffmpeg";
-    const audioProc = Bun.spawn(
-      [
-        ffmpegBin,
-        "-y",
-        "-i",
-        result.sourcePath,
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-q:a",
-        "4",
-        audioPath,
-      ],
-      { stdout: "pipe", stderr: "pipe" },
-    );
-    if ((await audioProc.exited) !== 0) {
-      throw new Error("Failed to extract audio");
-    }
-
-    const fullCaptions = await speechToText({
-      inputPath: audioPath,
-      language: body.language ?? "en",
-    });
-
-    const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
-    const platformKey = String(body.platform ?? "9:16");
-    const platform = validPlatforms.includes(platformKey as any)
-      ? (platformKey as keyof typeof ASPECTS)
-      : "9:16";
-    const aspect = ASPECTS[platform];
-
-    const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
-    const qualityKey = String(body.quality ?? "standard");
-    const quality = validQualities.includes(qualityKey as any)
-      ? (qualityKey as keyof typeof QUALITY)
-      : "standard";
-    const qual = QUALITY[quality];
-
-    const captionStyleName = String(body.captionStyle ?? "bold_pop");
-    const transitionType = String(body.transition ?? "crossfade");
-    const bgClips = listStockClips();
-
-    const ASS_STYLES = new Set([
-      "typewriter",
-      "bounce",
-      "shake",
-      "zoom",
-      "colorful",
-      "word_by_word",
-      "glow",
-      "neon",
-    ]);
-
-    const projects: any[] = [];
-    for (let i = 0; i < result.clips.length; i++) {
-      const clip = result.clips[i];
-      const projId = randomUUID();
-      const renderId = randomUUID();
-      const clipDur = (clip.endMs - clip.startMs) / 1000;
-      const clipStartSec = clip.startMs / 1000;
-
-      try {
-        const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
-        const tempFiles: string[] = [];
-
-        // Extract clip
-        const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
-        tempFiles.push(segPath);
-        await ffmpeg.run([
-          "-y",
-          "-ss",
-          String(clipStartSec),
-          "-i",
-          result.sourcePath,
-          "-t",
-          String(clipDur),
-          "-c",
-          "copy",
-          segPath,
-        ]);
-
-        // Get captions for this clip
-        const clipCaptions = fullCaptions.filter(
-          (cap) =>
-            cap.startMs >= clip.startMs - 500 && cap.endMs <= clip.endMs + 500,
-        );
-        const relativeCaptions = clipCaptions.map((cap) => ({
-          text: cap.text,
-          startMs: Math.max(0, cap.startMs - clip.startMs),
-          endMs: Math.min(clipDur * 1000, cap.endMs - clip.startMs),
-        }));
-        const grouped = groupCaptions(relativeCaptions, 4);
-
-        // Background: crop source to 9:16 (zoomed on speaker) or use gameplay
-        let renderPath = segPath;
-        const cropPath = join(OUTPUT_DIR, `${renderId}-crop.mp4`);
-        tempFiles.push(cropPath);
-        await ffmpeg.toAspect(segPath, cropPath, platform, quality);
-        renderPath = cropPath;
-
-        // Optional gameplay overlay
-        if (bgClips.length > 0 && body.bgVideo !== false) {
-          const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
-          tempFiles.push(bgPath);
-          const bg = bgClips[i % bgClips.length];
-          await ffmpeg.trim({ input: bg, end: clipDur + 2, output: bgPath });
-          const compPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
-          tempFiles.push(compPath);
-          await ffmpeg.composeSplitScreen(renderPath, bg, compPath, {
-            bgPosition: "right",
-          });
-          renderPath = compPath;
-        }
-
-        // Smart zoom
-        if (body.smartZoom) {
-          try {
-            const { detectFaces } = await import("@crayo/ai");
-            const faceDataPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
-            tempFiles.push(faceDataPath);
-            await detectFaces({
-              inputPath: renderPath,
-              outputPath: faceDataPath,
-            });
-            const zoomedPath = join(OUTPUT_DIR, `${renderId}-zoomed.mp4`);
-            tempFiles.push(zoomedPath);
-            await ffmpeg.smartZoom(renderPath, {
-              faceDataPath,
-              output: zoomedPath,
-              quality,
-            });
-            renderPath = zoomedPath;
-          } catch {}
-        }
-
-        // Mix audio
-        const voiceVol = Number(body.voiceVolume ?? 1.0);
-        const musicVol = Number(body.musicVolume ?? 0.1);
-        const hasMusic =
-          body.bgMusic !== false && listBgMusic().length > 0 && musicVol > 0;
-        if (voiceVol > 0 || hasMusic) {
-          const mixedAudioPath = join(
-            OUTPUT_DIR,
-            `${renderId}-mixed-audio.m4a`,
-          );
-          tempFiles.push(mixedAudioPath);
-          const mixedPath = join(OUTPUT_DIR, `${renderId}-mixed.mp4`);
-          tempFiles.push(mixedPath);
-          const tracks: any[] = [];
-          if (voiceVol > 0) tracks.push({ path: segPath, volume: voiceVol });
-          if (hasMusic) {
-            const bgMusic =
-              listBgMusic()[Math.floor(Math.random() * listBgMusic().length)];
-            tracks.push({ path: bgMusic, volume: musicVol, loop: true });
-          }
-          await mixAudio({
-            tracks,
-            sfx: [],
-            duration: clipDur,
-            output: mixedAudioPath,
-          });
-          await ffmpeg.addAudio(renderPath, mixedAudioPath, mixedPath);
-          renderPath = mixedPath;
-        }
-
-        // Apply captions
-        if (grouped.length > 0) {
-          if (ASS_STYLES.has(captionStyleName)) {
-            const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
-            tempFiles.push(assPath);
-            writeASS(
-              grouped.map((t) => ({
-                text: t.text,
-                startMs: t.startMs,
-                endMs: t.endMs,
-              })),
-              captionStyleName,
-              assPath,
-              aspect.width,
-              aspect.height,
-            );
-            await ffmpeg.renderASS(renderPath, assPath, outPath, quality);
-          } else {
-            const captionStyle = buildCaptionStyle(captionStyleName);
-            await ffmpeg.overlayText(
-              renderPath,
-              grouped.map((t) => ({ ...t, style: captionStyle })),
-              outPath,
-            );
-          }
-        } else {
-          await ffmpeg.run(["-y", "-i", renderPath, "-c", "copy", outPath]);
-        }
-
-        db.insert(project)
-          .values({
-            id: projId,
-            name: `Podcast: ${clip.text.slice(0, 40)}...`,
-            type: "podcast_clip",
-            script: clip.text,
-            url: body.url,
-            createdAt: new Date(),
-          })
-          .run();
-
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "done",
-            outputPath: outPath,
-            settings: JSON.stringify({
-              podcastClip: true,
-              startMs: clip.startMs,
-              endMs: clip.endMs,
-              score: clip.score,
-              sourceUrl: body.url,
-              captionStyle: captionStyleName,
-              platform,
-              quality,
-            }),
-            createdAt: new Date(),
-          })
-          .run();
-
-        for (const cap of grouped) {
-          db.insert(caption)
-            .values({
-              id: randomUUID(),
-              renderId,
-              text: cap.text,
-              startMs: cap.startMs + clip.startMs,
-              endMs: cap.endMs + clip.startMs,
-              style: JSON.stringify(captionStyleName),
-            })
-            .run();
-        }
-
-        for (const f of tempFiles) {
-          try {
-            unlinkSync(f);
-          } catch {}
-        }
-
-        projects.push({
-          projectId: projId,
-          renderId,
-          text: clip.text,
-          startMs: clip.startMs,
-          endMs: clip.endMs,
-          score: clip.score,
-        });
-      } catch (err: any) {
-        db.insert(project)
-          .values({
-            id: projId,
-            name: `Podcast (failed): ${clip.text.slice(0, 30)}...`,
-            type: "podcast_clip",
-            script: clip.text,
-            url: body.url,
-            status: "error",
-            createdAt: new Date(),
-          })
-          .run();
-        db.insert(render)
-          .values({
-            id: renderId,
-            projectId: projId,
-            status: "error",
-            error: err.message,
-            createdAt: new Date(),
-          })
-          .run();
-      }
-    }
-
-    try {
-      unlinkSync(audioPath);
-    } catch {}
-
-    return c.json({ clips: projects });
-  } catch (err: any) {
-    return c.json({ error: err.message }, 500);
-  }
-});
-
-// ─── Standup Comedy: YouTube special / local mp4 → comedy-optimized highlight clips ───
-// This is like auto-clip but with comedy-specific post-processing:
-//   • Extends clip end to capture audience laughter after each punchline
-//   • Smart zoom on comedians' faces (zoom cuts for reaction shots)
-//   • Punch-up title + word-by-word captions (tiktok-style "title + captions")
-//   • Comedy-specific caption style defaults (bold pop, lower-third placement)
+app.post("/api/auto-clip", async c => enqueueClip(c, "sermon_clip"));
+app.post("/api/sermon-clip", async c => enqueueClip(c, "sermon_clip"));
+app.post("/api/podcast-clip", async c => enqueueClip(c, "podcast_clip"));
 
 // ─── Music Edit: Beat-Synced Aesthetic Edits ───
 
@@ -1899,8 +853,8 @@ app.post("/api/music-edit", async (c) => {
     const { ASPECTS, QUALITY, ffmpeg, buildScatteredWordFilterComplex, generateViralASS } = await import("@crayo/core");
     const { detectBeats, snapToBeat, getBeatsInRange, calculateCutDensity } = await import("@crayo/ai");
 
-    const aspect = ASPECTS[body.platform || "9:16"];
-    const qual = QUALITY[body.quality || "high"];
+    const aspect = ASPECTS[(body.platform || "9:16") as keyof typeof ASPECTS];
+    const qual = QUALITY[(body.quality || "high") as keyof typeof QUALITY];
     const cutDensity = body.cutDensity || "auto";
     const minClipLength = Number(body.minClipLength || 0.5);
     const maxClipLength = Number(body.maxClipLength || 4);
@@ -2338,7 +1292,7 @@ app.post("/api/standup-clip", async (c) => {
           if (gapToNext > 500 && gapToNext < 5000) {
             // Audience pause (laughter) between punchline and next line
             extension = Math.min(gapToNext, 10000);
-          } else if (gapToNext >= 0 && gapToNext < 2000) {
+          } else if (nextSpeech && gapToNext >= 0 && gapToNext < 2000) {
             // Very short gap — likely a continuation of the same bit.
             // Extend to the end of the next speech + its trailing gap.
             let curEnd = nextSpeech.endMs;
@@ -2440,7 +1394,7 @@ app.post("/api/standup-clip", async (c) => {
 
         // Comedy tweaks #2 & #3: title overlay + captions + smart zoom
         const titleText = clip.suggestedTitle || hookIntro;
-        const captionText = clip.captions || [];
+        const captionText = (result.allCaptions ?? []).filter(c => c.endMs > clip.startMs && c.startMs < clip.endMs).map(c => ({ text: c.text, startMs: Math.max(0, c.startMs - clip.startMs), endMs: Math.min(clip.endMs - clip.startMs, c.endMs - clip.startMs) }));
 
         if (faceKeyframes.length > 0 && zoomOnLaughter) {
           // Smart zoom + captions + title
@@ -3090,434 +2044,82 @@ app.post("/api/remove-silence", async (c) => {
 
 // ─── Batch Clip: process multiple clips with progress tracking ───
 
-app.post("/api/batch-clip", async (c) => {
-  const body = await c.req.json();
-  if (!body.url || typeof body.url !== "string") {
-    return c.json({ error: "url is required" }, 400);
-  }
-  if (
-    !body.templateId ||
-    !["sermon_clip", "podcast_clip"].includes(body.templateId)
-  ) {
-    return c.json(
-      { error: "templateId must be sermon_clip or podcast_clip" },
-      400,
-    );
-  }
-
-  const batchId = randomUUID();
-
-  db.insert(batch)
-    .values({
-      id: batchId,
-      url: body.url,
-      templateId: body.templateId,
-      status: "processing",
-      totalClips: 0,
-      completedClips: 0,
-      createdAt: new Date(),
-    })
-    .run();
-
-  // Process in background — don't await
-  processBatch(batchId, body).catch((err) => {
-    db.update(batch)
-      .set({ status: "error", error: err.message })
-      .where(eq(batch.id, batchId))
-      .run();
-  });
-
-  return c.json({ batchId, status: "processing" });
-});
-
-app.get("/api/batch/:id/status", async (c) => {
-  const row = db
-    .select()
-    .from(batch)
-    .where(eq(batch.id, c.req.param("id")))
-    .get();
-  if (!row) return c.json({ error: "not found" }, 404);
-  return c.json({
-    id: row.id,
-    url: row.url,
-    templateId: row.templateId,
-    status: row.status,
-    totalClips: row.totalClips,
-    completedClips: row.completedClips,
-    error: row.error,
-    clips: row.resultJson ? JSON.parse(row.resultJson) : null,
-    createdAt: row.createdAt,
-  });
-});
-
-async function processBatch(batchId: string, body: any) {
-  const { autoClip, speechToText } = await import("@crayo/ai");
-  const { ASPECTS, QUALITY, ffmpeg, writeASS, mixAudio } = await import(
-    "@crayo/core"
-  );
-
-  // Step 1: Download + detect highlights
-  const result = await autoClip({
-    url: body.url,
-    clipCount: Number(body.clipCount ?? 5),
-    minDuration: Number(body.minDuration ?? 15),
-    maxDuration: Number(body.maxDuration ?? 60),
-    language: body.language ?? "en",
-  });
-
-  if (result.clips.length === 0) {
-    throw new Error("No highlights detected");
-  }
-
-  // Update total clips
-  db.update(batch)
-    .set({ totalClips: result.clips.length })
-    .where(eq(batch.id, batchId))
-    .run();
-
-  // Step 2: Transcribe full audio
-  const audioPath = join(OUTPUT_DIR, `.batch-audio-${randomUUID()}.mp3`);
-  const ffmpegBin = process.env.FFMPEG_PATH || "ffmpeg";
-  const audioProc = Bun.spawn(
-    [
-      ffmpegBin,
-      "-y",
-      "-i",
-      result.sourcePath,
-      "-vn",
-      "-acodec",
-      "libmp3lame",
-      "-q:a",
-      "4",
-      audioPath,
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  if ((await audioProc.exited) !== 0) {
-    throw new Error("Failed to extract audio");
-  }
-
-  const fullCaptions = await speechToText({
-    inputPath: audioPath,
-    language: body.language ?? "en",
-  });
-
-  // Resolve settings
-  const validPlatforms = Object.keys(ASPECTS) as (keyof typeof ASPECTS)[];
-  const platformKey = String(body.platform ?? "9:16");
-  const platform = validPlatforms.includes(platformKey as any)
-    ? (platformKey as keyof typeof ASPECTS)
-    : "9:16";
-  const aspect = ASPECTS[platform];
-
-  const validQualities = Object.keys(QUALITY) as (keyof typeof QUALITY)[];
-  const qualityKey = String(body.quality ?? "standard");
-  const quality = validQualities.includes(qualityKey as any)
-    ? (qualityKey as keyof typeof QUALITY)
-    : "standard";
-  const qual = QUALITY[quality];
-
-  const captionStyleName = String(body.captionStyle ?? "bold_pop");
-  const hookIntro = String(body.hookIntro ?? "");
-  const bgClips = listStockClips();
-
-  const ASS_STYLES = new Set([
-    "scripture", "testimony", "altar-call",
-    "typewriter",
-    "bounce",
-    "shake",
-    "zoom",
-    "colorful",
-    "word_by_word",
-    "glow",
-    "neon",
-  ]);
-
-  // Step 3: Render each clip
-  const projects: any[] = [];
-  for (let i = 0; i < result.clips.length; i++) {
-    const clip = result.clips[i];
-    const projId = randomUUID();
-    const renderId = randomUUID();
-    const clipDur = (clip.endMs - clip.startMs) / 1000;
-    const clipStartSec = clip.startMs / 1000;
-
-    try {
-      const outPath = join(OUTPUT_DIR, `${renderId}.mp4`);
-      const tempFiles: string[] = [];
-
-      // Extract clip
-      const segPath = join(OUTPUT_DIR, `${renderId}-seg.mp4`);
-      tempFiles.push(segPath);
-      await ffmpeg.run([
-        "-y",
-        "-ss",
-        String(clipStartSec),
-        "-i",
-        result.sourcePath,
-        "-t",
-        String(clipDur),
-        "-c",
-        "copy",
-        segPath,
-      ]);
-
-      // Silence removal: trim silent parts from clip
-      let clipSourcePath = segPath;
-      let clipDurationMult = 1;
-      if (body.silenceRemoval) {
-        try {
-          const { removeSilence } = await import("@crayo/ai");
-          const noSilencePath = join(OUTPUT_DIR, `${renderId}-nosilence.mp4`);
-          tempFiles.push(noSilencePath);
-          const silenceResult = await removeSilence({
-            inputPath: segPath,
-            outputPath: noSilencePath,
-          });
-          if (silenceResult.removedMs > 0) {
-            clipSourcePath = noSilencePath;
-            const newDur = await ffmpeg.getDuration(noSilencePath);
-            clipDurationMult = newDur / clipDur;
-          }
-        } catch {}
-      }
-
-      // Get captions for this clip
-      const clipCaptions = fullCaptions.filter(
-        (cap) =>
-          cap.startMs >= clip.startMs - 500 && cap.endMs <= clip.endMs + 500,
-      );
-      const relativeCaptions = clipCaptions.map((cap) => ({
-        text: cap.text,
-        startMs: Math.max(0, cap.startMs - clip.startMs),
-        endMs: Math.min(clipDur * 1000, cap.endMs - clip.startMs),
-      }));
-      const grouped = groupCaptions(relativeCaptions, 4);
-
-      // Background
-      let renderPath = clipSourcePath;
-      if (bgClips.length > 0 && body.bgVideo !== false) {
-        const bgPath = join(OUTPUT_DIR, `${renderId}-bg.mp4`);
-        tempFiles.push(bgPath);
-        const bg = bgClips[i % bgClips.length];
-        const bgDur =
-          clipDurationMult > 1 ? clipDur * clipDurationMult + 2 : clipDur + 2;
-        await ffmpeg.trim({ input: bg, end: bgDur, output: bgPath });
-        const compPath = join(OUTPUT_DIR, `${renderId}-comp.mp4`);
-        tempFiles.push(compPath);
-        await ffmpeg.composeSplitScreen(clipSourcePath, bg, compPath, {
-          bgPosition: "right",
-        });
-        renderPath = compPath;
-      }
-
-      // Format to aspect
-      const aspectPath = join(OUTPUT_DIR, `${renderId}-aspect.mp4`);
-      tempFiles.push(aspectPath);
-      await ffmpeg.toAspect(renderPath, aspectPath, platform, quality);
-      renderPath = aspectPath;
-
-      // Smart zoom
-      if (body.smartZoom && bgClips.length > 0) {
-        try {
-          const { detectFaces } = await import("@crayo/ai");
-          const faceDataPath = join(OUTPUT_DIR, `${renderId}-faces.json`);
-          tempFiles.push(faceDataPath);
-          await detectFaces({
-            inputPath: renderPath,
-            outputPath: faceDataPath,
-          });
-          const zoomedPath = join(OUTPUT_DIR, `${renderId}-zoomed.mp4`);
-          tempFiles.push(zoomedPath);
-          await ffmpeg.smartZoom(renderPath, {
-            faceDataPath,
-            output: zoomedPath,
-            quality,
-          });
-          renderPath = zoomedPath;
-        } catch {}
-      }
-
-      // Mix audio
-      const voiceVol = Number(body.voiceVolume ?? 1.0);
-      const musicVol = Number(body.musicVolume ?? 0.15);
-      const hasMusic =
-        body.bgMusic !== false && listBgMusic().length > 0 && musicVol > 0;
-      if (voiceVol > 0 || hasMusic) {
-        const mixedAudioPath = join(OUTPUT_DIR, `${renderId}-mixed-audio.m4a`);
-        tempFiles.push(mixedAudioPath);
-        const mixedPath = join(OUTPUT_DIR, `${renderId}-mixed.mp4`);
-        tempFiles.push(mixedPath);
-        const tracks: any[] = [];
-        if (voiceVol > 0)
-          tracks.push({ path: clipSourcePath, volume: voiceVol });
-        if (hasMusic) {
-          const bgMusic =
-            listBgMusic()[Math.floor(Math.random() * listBgMusic().length)];
-          tracks.push({ path: bgMusic, volume: musicVol, loop: true });
-        }
-        await mixAudio({
-          tracks,
-          sfx: [],
-          duration: clipDur,
-          output: mixedAudioPath,
-        });
-        await ffmpeg.addAudio(renderPath, mixedAudioPath, mixedPath);
-        renderPath = mixedPath;
-      }
-
-      // Apply captions
-      if (grouped.length > 0) {
-        if (ASS_STYLES.has(captionStyleName)) {
-          const assPath = join(OUTPUT_DIR, `${renderId}-captions.ass`);
-          tempFiles.push(assPath);
-          writeASS(
-            grouped.map((t) => ({
-              text: t.text,
-              reference: String(body.scriptureReference ?? ""),
-              startMs: t.startMs,
-              endMs: t.endMs,
-            })),
-            captionStyleName,
-            assPath,
-            aspect.width,
-            aspect.height,
-          );
-          await ffmpeg.renderASS(renderPath, assPath, outPath, quality);
-        } else {
-          const captionStyle = buildCaptionStyle(captionStyleName);
-          await ffmpeg.overlayText(
-            renderPath,
-            grouped.map((t) => ({ ...t, style: captionStyle })),
-            outPath,
-          );
-        }
-      } else {
-        await ffmpeg.run(["-y", "-i", renderPath, "-c", "copy", outPath]);
-      }
-
-      // Hook intro overlay
-      if (hookIntro && body.templateId === "sermon_clip") {
-        const withHookPath = join(OUTPUT_DIR, `${renderId}-hook.mp4`);
-        tempFiles.push(withHookPath);
-        await ffmpeg.overlayText(
-          outPath,
-          [
-            {
-              text: hookIntro,
-              startMs: 0,
-              endMs: 3000,
-              style: {
-                fontSize: 56,
-                fontColor: "white",
-                position: "center",
-                outline: true,
-                outlineColor: "black",
-              },
-            },
-          ],
-          withHookPath,
-        );
-        const { renameSync } = await import("fs");
-        unlinkSync(outPath);
-        renameSync(withHookPath, outPath);
-      }
-
-      await applyClientBranding(body.clientId, outPath);
-
-      db.insert(project)
-        .values({
-          id: projId,
-          clientId: body.clientId ?? null,
-          name: `Batch: ${clip.text.slice(0, 40)}...`,
-          type: body.templateId,
-          script: clip.text,
-          url: body.url,
-          createdAt: new Date(),
-        })
-        .run();
-
-      db.insert(render)
-        .values({
-          id: renderId,
-          projectId: projId,
-          status: "done",
-          outputPath: outPath,
-          settings: JSON.stringify({
-            batchId,
-            startMs: clip.startMs,
-            endMs: clip.endMs,
-            score: clip.score,
-            sourceUrl: body.url,
-            captionStyle: captionStyleName,
-            platform,
-            quality,
-          }),
-          createdAt: new Date(),
-        })
-        .run();
-
-      for (const cap of grouped) {
-        db.insert(caption)
-          .values({
-            id: randomUUID(),
-            renderId,
-            text: cap.text,
-            startMs: cap.startMs + clip.startMs,
-            endMs: cap.endMs + clip.startMs,
-            style: JSON.stringify(captionStyleName),
-          })
-          .run();
-      }
-
-      for (const f of tempFiles) {
-        try {
-          unlinkSync(f);
-        } catch {}
-      }
-
-      projects.push({
-        projectId: projId,
-        renderId,
-        text: clip.text,
-        startMs: clip.startMs,
-        endMs: clip.endMs,
-        score: clip.score,
-      });
-    } catch (err: any) {
-      projects.push({
-        projectId: projId,
-        renderId,
-        text: clip.text,
-        startMs: clip.startMs,
-        endMs: clip.endMs,
-        score: clip.score,
-        error: err.message,
-      });
-    }
-
-    // Update progress
-    db.update(batch)
-      .set({ completedClips: i + 1 })
-      .where(eq(batch.id, batchId))
-      .run();
-  }
-
-  // Cleanup
+async function enqueueClip(c: any, templateId?: string) {
   try {
-    unlinkSync(audioPath);
-  } catch {}
-
-  // Mark done
-  db.update(batch)
-    .set({
-      status: "done",
-      completedClips: result.clips.length,
-      resultJson: JSON.stringify(projects),
-    })
-    .where(eq(batch.id, batchId))
-    .run();
+    const body = await c.req.json();
+    const source = sourceOptions(body);
+    const limits = validateClipOptions({ clipCount: Number(body.clipCount ?? 5), minDuration: Number(body.minDuration ?? 15), maxDuration: Number(body.maxDuration ?? 60) });
+    const type = templateId ?? body.templateId;
+    if (!["sermon_clip", "podcast_clip"].includes(type)) throw new Error("Unsupported clipping workflow.");
+    if (body.clientId && !db.select().from(client).where(eq(client.id, body.clientId)).get()) throw new Error("Client not found.");
+    if (db.select().from(batch).all().filter(b => ["queued", "queued_render", "analyzing", "rendering"].includes(b.status)).length >= 10) return c.json({ error: "Queue full. Wait for a job to finish." }, 429);
+    const platform = body.platform ?? "9:16";
+    const quality = body.quality ?? "standard";
+    if (!["9:16", "1:1", "16:9"].includes(platform) || !["draft", "standard", "high", "ultra"].includes(quality)) throw new Error("Invalid aspect ratio or quality.");
+    const volume = Number(body.voiceVolume ?? 1);
+    if (!Number.isFinite(volume) || volume < 0 || volume > 2) throw new Error("Voice volume must be between 0 and 2.");
+    const payload = { ...source, ...limits, templateId: type, clientId: body.clientId, platform, quality,
+      language: String(body.language ?? "en"), captionStyle: String(body.captionStyle ?? "scripture"),
+      scriptureReference: String(body.scriptureReference ?? "").slice(0, 200), smartZoom: body.smartZoom === true,
+      silenceRemoval: body.silenceRemoval === true, voiceVolume: volume };
+    const id = randomUUID();
+    db.insert(batch).values({ id, url: source.url ?? source.localFilePath!, templateId: type, status: "queued", payloadJson: JSON.stringify(payload), createdAt: new Date() }).run();
+    void drainClipQueue();
+    return c.json({ batchId: id, status: "queued" }, 202);
+  } catch (error: any) { return c.json({ error: error.message }, 400); }
 }
+app.post("/api/batch-clip", async c => enqueueClip(c));
+app.get("/api/batches", c => c.json(db.select().from(batch).all().map(b => ({ id: b.id, status: b.status, error: b.error, createdAt: b.createdAt }))));
+app.get("/api/batch/:id/status", c => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("id"))).get();
+  if (!row) return c.json({ error: "Batch not found." }, 404);
+  const results = JSON.parse(row.resultJson || "[]");
+  const analysis = row.analysisJson ? JSON.parse(row.analysisJson) : null;
+  return c.json({ id: row.id, status: row.status, totalClips: row.totalClips, completedClips: row.completedClips,
+    failedClips: results.filter((r: any) => r.error).length, error: row.error, clips: results,
+    candidates: row.status === "review" ? analysis?.candidates : undefined,
+    transcript: row.status === "review" ? analysis?.captions : undefined });
+});
+app.get("/api/batch/:id/source", c => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("id"))).get();
+  if (!row?.analysisJson || row.status !== "review") return c.json({ error: "Source preview is available during review." }, 409);
+  const source = managedPath(JSON.parse(row.analysisJson).sourcePath);
+  if (!existsSync(source)) return c.json({ error: "Source no longer exists." }, 404);
+  return mediaResponse(source, c.req.header("Range"));
+});
+app.post("/api/batch/:id/approve", async c => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("id"))).get();
+  if (!row?.analysisJson || row.status !== "review") return c.json({ error: "Batch is not awaiting review." }, 409);
+  try {
+    const body = await c.req.json();
+    if (body.contextConfirmed !== true) throw new Error("Confirm you reviewed the excerpts in context.");
+    const analysis = JSON.parse(row.analysisJson);
+    analysis.candidates = validateReview(analysis, body.clips);
+    const payload = { ...JSON.parse(row.payloadJson!), reviewedAt: new Date().toISOString() };
+    db.update(batch).set({ status: "queued_render", analysisJson: JSON.stringify(analysis), payloadJson: JSON.stringify(payload), totalClips: analysis.candidates.length }).where(eq(batch.id, row.id)).run();
+    void drainClipQueue();
+    return c.json({ batchId: row.id, status: "queued_render" }, 202);
+  } catch (error: any) { return c.json({ error: error.message }, 400); }
+});
+app.post("/api/batch/:id/retry", c => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("id"))).get();
+  if (!row?.payloadJson || !["error", "partial", "interrupted"].includes(row.status)) return c.json({ error: "This batch cannot be retried." }, 409);
+  const analysis = row.analysisJson ? JSON.parse(row.analysisJson) : null;
+  const status = analysis?.candidates.some((x: any) => x.approved) ? "queued_render" : "queued";
+  if (analysis && !existsSync(analysis.sourcePath)) return c.json({ error: "Source was removed. Create a new batch." }, 409);
+  db.update(batch).set({ status, error: null }).where(eq(batch.id, row.id)).run();
+  void drainClipQueue();
+  return c.json({ batchId: row.id, status }, 202);
+});
+app.delete("/api/batch/:id", c => {
+  const row = db.select().from(batch).where(eq(batch.id, c.req.param("id"))).get();
+  if (!row) return c.json({ error: "Batch not found." }, 404);
+  if (["queued", "queued_render", "analyzing", "rendering"].includes(row.status)) return c.json({ error: "Wait for processing to stop before discarding." }, 409);
+  if (row.analysisJson) cleanupAnalysis(JSON.parse(row.analysisJson));
+  db.delete(batch).where(eq(batch.id, row.id)).run();
+  return c.json({ ok: true });
+});
+
 
 // ─── Reddit scraper ───
 
@@ -4005,30 +2607,7 @@ async function renderVideo(renderId: string, proj: any, settings: any) {
         await ffmpeg.trim({ input: proj.url, output: outPath });
       }
     } else {
-      await ffmpeg.run([
-        "-f",
-        "lavfi",
-        "-i",
-        `color=c=black:s=${aspect.width}x${aspect.height}:d=10`,
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=r=44100:cl=stereo",
-        "-t",
-        "10",
-        "-c:v",
-        "libx264",
-        "-preset",
-        qual.preset,
-        "-crf",
-        String(qual.crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-shortest",
-        outPath,
-      ]);
+      throw new Error(`Unsupported render workflow: ${proj.type}. Use the reviewed clip pipeline.`);
     }
 
     await applyClientBranding(proj.clientId, outPath);
@@ -4264,8 +2843,8 @@ app.post("/api/silence-detect", async (c) => {
   }
 
   try {
-    const { detectSilence } = await import("@crayo/ai");
-    const analysis = await detectSilence({
+    const { analyzeSilence } = await import("@crayo/ai");
+    const analysis = await analyzeSilence({
       inputPath: body.inputPath,
       threshold: body.threshold,
       minSilenceMs: body.minSilenceMs,
@@ -4297,8 +2876,8 @@ app.post("/api/silence-remove", async (c) => {
   }
 
   try {
-    const { removeSilence } = await import("@crayo/ai");
-    const result = await removeSilence({
+    const { editSilence } = await import("@crayo/ai");
+    const result = await editSilence({
       inputPath: body.inputPath,
       outputPath: body.outputPath,
       mode,
@@ -4458,38 +3037,7 @@ app.post("/api/export-timeline", async (c) => {
 
 // ─── Enhancement 12: Social Publishing Endpoint ───
 
-app.post("/api/publish", async (c) => {
-  const body = await c.req.json();
-  if (!body.videoPath || typeof body.videoPath !== "string") {
-    return c.json({ error: "videoPath is required" }, 400);
-  }
-  if (!body.platforms || !Array.isArray(body.platforms) || body.platforms.length === 0) {
-    return c.json({ error: "platforms array is required (tiktok, youtube, instagram)" }, 400);
-  }
-  if (!existsSync(body.videoPath)) {
-    return c.json({ error: `File not found: ${body.videoPath}` }, 404);
-  }
-
-  try {
-    const { publishVideo } = await import("@crayo/ai");
-    const result = await publishVideo({
-      videoPath: body.videoPath,
-      platforms: body.platforms,
-      title: body.title,
-      caption: body.caption,
-      hashtags: body.hashtags,
-      scheduledAt: body.scheduledAt,
-      thumbnail: body.thumbnail,
-      privacy: body.privacy,
-      tiktok: body.tiktok,
-      youtube: body.youtube,
-      instagram: body.instagram,
-    });
-    return c.json(result);
-  } catch (err: any) {
-    return c.json({ error: err.message }, 500);
-  }
-});
+app.post("/api/publish", c => c.json({ error: "Automatic publishing is disabled in this local release. Download and post manually." }, 501));
 
 // ─── Enhancement 13: Split-Screen Gameplay Endpoint ───
 
@@ -4560,7 +3108,13 @@ app.post("/api/batch-render", async (c) => {
   }
 });
 
+if (process.env.CRAYO_TEST_MODE !== "1") {
+  recoverJobs();
+  void drainClipQueue();
+}
+export { app };
 export default {
+  hostname: "127.0.0.1",
   port,
   fetch: app.fetch,
   maxRequestBodySize: MAX_UPLOAD_BYTES,

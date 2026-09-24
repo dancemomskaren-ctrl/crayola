@@ -1,14 +1,16 @@
 // Music Edit / Beat Sync template
 // Automatically cuts video clips to music beats
 
-import type { Template } from "./types";
+import type { Template } from "./templates";
+// Development-only schema: this template is not exposed by availableTemplates.
+type MusicField = Omit<Template["fields"][number], "type"> & { type: Template["fields"][number]["type"] | "file" | "checkbox"; accept?: string; required?: boolean; multiple?: boolean; help?: string };
 
-export const musicEditTemplate: Template = {
+export const musicEditTemplate: Omit<Template, "fields"> & { fields: MusicField[] } = {
   id: "music-edit",
   name: "Music Edit",
   icon: "🎵",
-  description: "Auto-cut video clips to music beats (aesthetic edits, AMV, GMV)",
-  category: "creative",
+  desc: "Auto-cut video clips to music beats (aesthetic edits, AMV, GMV)",
+  category: "story",
   
   defaults: {
     platform: "9:16",

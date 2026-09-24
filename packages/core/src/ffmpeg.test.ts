@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
-import { escapeDrawtext, getDuration, run } from "../src/ffmpeg";
-import { existsSync, writeFileSync, unlinkSync } from "fs";
+import { escapeDrawtext, getDuration, run, overlayText } from "../src/ffmpeg";
+import { existsSync, writeFileSync, unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
 
 describe("escapeDrawtext", () => {
@@ -8,8 +9,8 @@ describe("escapeDrawtext", () => {
     expect(escapeDrawtext("hello\\world")).toBe("hello\\\\world");
   });
 
-  test("escapes percent signs", () => {
-    expect(escapeDrawtext("50%")).toBe("50%%");
+  test("keeps percent signs literal with expansion disabled", () => {
+    expect(escapeDrawtext("50%")).toBe("50%");
   });
 
   test("escapes colons", () => {
@@ -31,7 +32,7 @@ describe("escapeDrawtext", () => {
   test("handles complex mixed text", () => {
     const input = "50% off: [today] only! Price: $10\\$";
     const result = escapeDrawtext(input);
-    expect(result).toContain("%%");
+    expect(result).toContain("50%");
     expect(result).toContain("\\:");
     expect(result).toContain("\\[");
     expect(result).toContain("\\]");
@@ -41,16 +42,21 @@ describe("escapeDrawtext", () => {
 
 describe("getDuration", () => {
   test("returns duration of a valid audio file", async () => {
-    // Use the TTS test file from earlier if it exists, otherwise skip
-    const testFile = join(import.meta.dir, "../../../data/renders");
-    const { readdirSync } = await import("fs");
-    if (!existsSync(testFile)) return;
-
-    const files = readdirSync(testFile).filter((f) => f.endsWith(".mp4"));
-    if (files.length === 0) return;
-
-    const dur = await getDuration(join(testFile, files[0]));
-    expect(dur).toBeGreaterThan(0);
+    const dir = mkdtempSync(join(tmpdir(), "crayo-duration-"));
+    try {
+      const input = join(dir, "fixture.mp4");
+      await run(["-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", input]);
+      expect(await getDuration(input)).toBeGreaterThan(0.9);
+      const output = join(dir, "caption.mp4");
+      await overlayText(input, [{ text: "50%", startMs: 0, endMs: 1000 }], output);
+      async function frame(path: string) {
+        const p = Bun.spawn([process.env.FFMPEG_PATH || "ffmpeg", "-v", "error", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"], { stdout: "pipe", stderr: "ignore" });
+        const bytes = new Uint8Array(await new Response(p.stdout).arrayBuffer());
+        expect(await p.exited).toBe(0);
+        return bytes.reduce((a, b) => a + b, 0);
+      }
+      expect(await frame(output)).toBeGreaterThan(await frame(input));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   test("returns 0 for non-existent file", async () => {

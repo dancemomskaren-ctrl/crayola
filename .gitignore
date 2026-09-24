@@ -17,3 +17,10 @@ assets/voices/*
 # Keep asset directories
 !assets/stocks/.gitkeep
 !assets/styles/.gitkeep
+
+# Local tooling, agent scratch and backups — never commit
+.github-tools/
+.freebuff/
+.crayola-backups/
+.obsidian/
+upload-post-larry-marketing-skill/

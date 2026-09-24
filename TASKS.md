@@ -5,7 +5,7 @@ Work through these in order. One task at a time. Commit after each.
 
 ## PHASE 1 — Church Clipping Core (do these first)
 
-- [ ] **sermon-scoring-v2:** Rewrite `detectHighlights()` in `packages/ai/src/index.ts` to score clips using church-specific signals: scripture references (book names, chapter:verse patterns), altar call language ("come forward", "repeat after me", "raise your hand"), testimony language ("I was", "God healed", "before I knew Christ"), and emotional peaks (audience laughter/applause markers in transcript). Weight these higher than generic hook words.
+- [x] **sermon-scoring-v2:** Rewrite `detectHighlights()` in `packages/ai/src/index.ts` to score clips using church-specific signals: scripture references (book names, chapter:verse patterns), altar call language ("come forward", "repeat after me", "raise your hand"), testimony language ("I was", "God healed", "before I knew Christ"), and emotional peaks (audience laughter/applause markers in transcript). Weight these higher than generic hook words.
 
 - [x] **christian-clip-titles:** In `packages/ai/src/index.ts`, add `generateChristianClipTitle(text: string, apiKey: string, apiBase: string): Promise<string>` that uses the LLM to generate a short viral-ready clip title for church social media (e.g. "Pastor's 30-second testimony will wreck you 😭"). Wire it up in the `/api/auto-clip` route so each clip gets a `suggestedTitle`.
 
@@ -58,3 +58,16 @@ Work through these in order. One task at a time. Commit after each.
 - [ ] **pricing-tiers:** Add a `tier` field to the clients table: `"free"` (5 clips/month), `"starter"` ($29/mo, 50 clips), `"pro"` ($79/mo, unlimited). Enforce clip limits in the render pipeline — return a 402 error with a friendly message when a free client hits 5 clips.
 
 - [ ] **export-for-upload:** After render completes, add a "Copy Caption" button next to each clip download. Pre-fills a caption template: "[Clip title] 🙏 [auto-generated hashtags from transcript keywords] #church #sermon #faith #[pastor name if detected]". Let user edit before copying.
+
+## Audit repair — September 2026
+
+- [x] Repair local upload clipping and missing API exports/type contracts.
+- [x] Enforce valid excerpt durations and bounded selection loops.
+- [x] Route supported templates explicitly; hide unsupported workflows.
+- [x] Add context preview, excerpt selection, caption corrections, and human approval.
+- [x] Persist clipping jobs, recover interrupted jobs, and retry partial failures without duplicating successes.
+- [x] Correct silence/caption timing and provide successful-only exports.
+- [x] Restrict local access and media paths; remove false publishing success.
+- [x] Add deterministic clipping/API regression tests with real FFmpeg output.
+
+Scope: local clipping workflow repair. Hosted SaaS readiness and live model accuracy remain separate work.

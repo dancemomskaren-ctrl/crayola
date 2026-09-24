@@ -4,9 +4,9 @@ import { join } from "path";
 let ffmpegPath = "";
 
 try {
-  ffmpegPath = require("ffmpeg-static");
+  ffmpegPath = process.env.FFMPEG_PATH || Bun.which("ffmpeg") || require("ffmpeg-static");
 } catch {
-  ffmpegPath = "ffmpeg";
+  ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
 }
 
 export interface ClipOpts {
@@ -132,15 +132,18 @@ export const QUALITY: Record<QualityPreset, QualityDef> = {
 function spawnFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, ["-y", ...args], { stdio: "pipe" });
+    const timer = setTimeout(() => proc.kill("SIGKILL"), 60 * 60 * 1000);
+    timer.unref();
     let stderr = "";
     proc.stderr?.on("data", (d: Buffer) => {
       stderr += d.toString();
     });
     proc.on("close", (code) => {
+      clearTimeout(timer);
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-500)}`));
     });
-    proc.on("error", reject);
+    proc.on("error", error => { clearTimeout(timer); reject(error); });
   });
 }
 
@@ -168,7 +171,6 @@ export async function getDuration(input: string): Promise<number> {
 export function escapeDrawtext(text: string): string {
   return text
     .replace(/\\/g, "\\\\")
-    .replace(/%/g, "%%")
     .replace(/'/g, "'\\\\\\''")
     .replace(/:/g, "\\:")
     .replace(/\[/g, "\\[")
@@ -306,6 +308,14 @@ export async function toVertical(
   return toAspect(input, output, "9:16");
 }
 
+export async function centerCrop(input: string, output: string, ratio: AspectRatio, quality: QualityPreset = "standard") {
+  const { width, height } = ASPECTS[ratio];
+  const q = QUALITY[quality];
+  await run(["-i", input, "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`,
+    "-c:v", "libx264", "-preset", q.preset, "-crf", String(q.crf), "-c:a", "aac", output]);
+  return output;
+}
+
 export async function toAspect(
   input: string,
   output: string,
@@ -357,7 +367,7 @@ export async function overlayText(
       fontOpts += `:borderw=3:bordercolor=${s.outlineColor}`;
     }
     filters.push(
-      `drawtext=text='${escaped}':${fontOpts}:enable='between(t,${(t.startMs / 1000).toFixed(2)},${(t.endMs / 1000).toFixed(2)})'`,
+      `drawtext=expansion=none:text='${escaped}':${fontOpts}:enable='between(t,${(t.startMs / 1000).toFixed(2)},${(t.endMs / 1000).toFixed(2)})'`,
     );
   }
   await run([

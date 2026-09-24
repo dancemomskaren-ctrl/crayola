@@ -20,6 +20,8 @@ export interface Template {
   desc: string;
   category: "story" | "conversation" | "quiz" | "reaction" | "educational" | "ministry";
   icon: string;
+  pipeline?: "sermon_clip" | "podcast_clip";
+  unavailableReason?: string;
   defaults: Record<string, any>;
   fields: TemplateField[];
 }
@@ -1215,6 +1217,7 @@ export const TEMPLATES: Template[] = [
     ],
   },
   {
+    id: "testimony_story",
     name: "Testimony",
     desc: "Personal testimony with emotional captions + dramatic music",
     category: "story",
@@ -2285,3 +2288,20 @@ export const CHRISTIAN_TEMPLATES: Template[] = [
 
 // Merge Christian templates into main TEMPLATES array
 TEMPLATES.push(...CHRISTIAN_TEMPLATES);
+
+// Keep experimental definitions for development, but do not offer unfinished flows.
+const clipTemplates = new Set(["auto_clip", "sermon_clip", "sermon_highlight", "altar_call", "holiday_special", "testimony_short", "pastor_weekly"]);
+for (const template of TEMPLATES) {
+  if (clipTemplates.has(template.id) || template.id === "podcast_clip") {
+    template.pipeline = template.id === "podcast_clip" ? "podcast_clip" : "sermon_clip";
+    template.defaults.type = template.pipeline;
+    template.defaults.bgVideo = false;
+    template.defaults.bgMusic = false;
+    template.fields = template.fields.filter(f => !["bgVideo", "bgMusic", "musicVolume", "hookIntro", "transition", "premium", "emotionDetection"].includes(f.key));
+    if (!template.fields.some(f => f.key === "url")) template.fields.unshift({ key: "url", label: "Video URL or upload", type: "text" });
+  } else if (!["story", "fake_text", "quiz", "split_screen"].includes(template.defaults.type) ||
+      (template.defaults.type === "story" && !template.fields.some(f => ["script", "redditUrl"].includes(f.key)) && template.id !== "quiz")) {
+    template.unavailableReason = "This workflow is not yet connected to a verified renderer.";
+  }
+}
+export function availableTemplates() { return TEMPLATES.filter(t => !t.unavailableReason); }

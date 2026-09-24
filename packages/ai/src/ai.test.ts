@@ -29,7 +29,7 @@ describe("listVoices", () => {
 });
 
 describe("textToSpeech", () => {
-  test("generates audio from text", async () => {
+  test.skipIf(process.env.CRAYO_LIVE_TESTS !== "1")("generates audio from text", async () => {
     const outPath = join(import.meta.dir, "../../../data/renders/test-tts.mp3");
     await textToSpeech({
       text: "Hello, this is a test.",
@@ -43,7 +43,7 @@ describe("textToSpeech", () => {
     unlinkSync(outPath);
   }, 15000);
 
-  test("throws on empty text", async () => {
+  test.skipIf(process.env.CRAYO_LIVE_TESTS !== "1")("throws on empty text", async () => {
     const outPath = join(
       import.meta.dir,
       "../../../data/renders/test-tts-fail.mp3",
@@ -56,7 +56,7 @@ describe("textToSpeech", () => {
 });
 
 describe("speechToText", () => {
-  test("transcribes audio to captions", async () => {
+  test.skipIf(process.env.CRAYO_LIVE_TESTS !== "1")("transcribes audio to captions", async () => {
     // First generate a TTS file to transcribe
     const ttsPath = join(
       import.meta.dir,
@@ -147,7 +147,7 @@ describe("generateScript", () => {
     if (original) process.env.DEEPSEEK_API_KEY = original;
   });
 
-  test("generates script with valid API key", async () => {
+  test.skipIf(process.env.CRAYO_LIVE_TESTS !== "1")("generates script with valid API key", async () => {
     const apiKey = process.env.DEEPSEEK_API_KEY;
     if (!apiKey) {
       console.log("Skipping: DEEPSEEK_API_KEY not set");

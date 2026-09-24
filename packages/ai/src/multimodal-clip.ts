@@ -217,7 +217,7 @@ export async function autoClipPro(
       "--no-playlist",
       "-o",
       sourcePath,
-      opts.url,
+      opts.url ?? "",
     ],
     { stdout: "pipe", stderr: "pipe" },
   );

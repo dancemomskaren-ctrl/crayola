@@ -23,7 +23,7 @@ export type {
 } from "./ffmpeg";
 export { generateFakeText } from "./fake-text";
 export type { Message, FakeTextOpts } from "./fake-text";
-export { TEMPLATES, getTemplate, getTemplatesByCategory } from "./templates";
+export { TEMPLATES, availableTemplates, getTemplate, getTemplatesByCategory } from "./templates";
 export type { Template, TemplateField } from "./templates";
 export { generateASS, writeASS, getCaptionStyles } from "./ass";
 export type { CaptionAnim } from "./ass";

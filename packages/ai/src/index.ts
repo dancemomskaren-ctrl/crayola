@@ -695,7 +695,7 @@ export async function speechToText(opts: STTOpts): Promise<Caption[]> {
 
     const proc = Bun.spawn(
       [
-        "whisper",
+        process.env.WHISPER_PATH || "whisper",
         opts.inputPath,
         "--model",
         model,
@@ -964,7 +964,11 @@ export interface HighlightSegment {
 }
 
 export interface AutoClipOpts {
-  url: string;
+  url?: string;
+  localFilePath?: string;
+  /** Keep analysis separate from rendering for the review workflow. */
+  extractClips?: boolean;
+  workDir?: string;
   clipCount?: number;
   minDuration?: number;
   maxDuration?: number;
@@ -973,6 +977,7 @@ export interface AutoClipOpts {
 
 export interface AutoClipResult {
   sourcePath: string;
+  workDir?: string;
   clips: {
     path: string;
     startMs: number;
@@ -1044,18 +1049,24 @@ const HOOK_WORD_BOOST = 1.2;
 const QUIET_AFTER_BOOST = 1.4;
 const POSITION_BEGINNING_BOOST = 1.1;
 
-const SCRIPTURE_BOOK = /\b(?:Genesis|Exodus|Leviticus|Numbers|Deuteronomy|Joshua|Judges|Ruth|Samuel|Kings|Chronicles|Ezra|Nehemiah|Esther|Job|Psalms?|Proverbs|Ecclesiastes|Song of (?:Solomon|Songs)|Isaiah|Jeremiah|Lamentations|Ezekiel|Daniel|Hosea|Joel|Amos|Obadiah|Jonah|Micah|Nahum|Habakkuk|Zephaniah|Haggai|Zechariah|Malachi|Matthew|Mark|Luke|John|Acts|Romans|Corinthians|Galatians|Ephesians|Philippians|Colossians|Thessalonians|Timothy|Titus|Philemon|Hebrews|James|Peter|Jude|Revelation)\b/i;
+const SCRIPTURE_BOOK = /\b(?:Genesis|Exodus|Leviticus|Deuteronomy|Joshua|Ruth|Samuel|Kings|Chronicles|Ezra|Nehemiah|Esther|Psalms?|Proverbs|Ecclesiastes|Song of (?:Solomon|Songs)|Isaiah|Jeremiah|Lamentations|Ezekiel|Daniel|Hosea|Joel|Amos|Obadiah|Jonah|Micah|Nahum|Habakkuk|Zephaniah|Haggai|Zechariah|Malachi|Matthew|Luke|John|Romans|Corinthians|Galatians|Ephesians|Philippians|Colossians|Thessalonians|Timothy|Titus|Philemon|Hebrews|James|Peter|Jude|Revelation)\b/i;
+// Common words need citation context to count as Bible books.
+const AMBIGUOUS_SCRIPTURE_BOOK = /\b(?:(?:book of|turn to|read from|reading from|in) (?:Numbers|Judges|Job|Mark|Acts)\b|(?:Numbers|Judges|Job|Mark|Acts) (?:\d{1,3}\b|chapter\b))/i;
+const CHAPTER_VERSE = /\b\d{1,3}\s*:\s*\d{1,3}(?:\s*[-–]\s*\d{1,3})?\b/;
 const ALTAR_CALL = /\b(?:come forward|repeat after me|raise your hands?|give your life to (?:Jesus|Christ)|accept Jesus|altar call)\b/i;
 const TESTIMONY = /\b(?:I was|God healed|before I knew Christ|my testimony|Jesus saved me|God delivered me)\b/i;
-const AUDIENCE_PEAK = /(?:\[|\()(?:audience\s+)?(?:laughter|laughing|applause|applauding|cheering)(?:\]|\))/i;
+const AUDIENCE_PEAK = /(?:\[[^\]]*\b(?:laughter|laughing|laughs|applause|applauding|cheering)\b[^\]]*\]|\([^)]*\b(?:laughter|laughing|laughs|applause|applauding|cheering)\b[^)]*\))/i;
 
 export function detectHighlights(
   captions: Caption[],
   opts?: { clipCount?: number; minDuration?: number; maxDuration?: number },
 ): HighlightSegment[] {
-  const clipCount = opts?.clipCount ?? 5;
-  const minDur = (opts?.minDuration ?? 15) * 1000;
-  const maxDur = (opts?.maxDuration ?? 60) * 1000;
+  const { clipCount, minDuration, maxDuration } = validateClipOptions(opts);
+  const minDur = minDuration * 1000;
+  const maxDur = maxDuration * 1000;
+  captions = captions.filter(c => typeof c.text === "string" && c.text.trim() &&
+    Number.isFinite(c.startMs) && Number.isFinite(c.endMs) && c.startMs >= 0 && c.endMs > c.startMs)
+    .sort((a, b) => a.startMs - b.startMs);
   const totalDur =
     captions.length > 0 ? captions[captions.length - 1].endMs : 0;
 
@@ -1069,7 +1080,7 @@ export function detectHighlights(
   let current = { startMs: 0, endMs: 0, text: "", words: [] as Caption[] };
 
   for (const cap of captions) {
-    if (current.words.length > 0 && cap.startMs - current.endMs > 500) {
+    if (current.words.length > 0 && (cap.startMs - current.endMs > 500 || /[.!?][\"')]*$/.test(current.text.trim()) || cap.endMs - current.startMs > maxDur)) {
       if (current.text.trim()) sentences.push({ ...current });
       current = {
         startMs: cap.startMs,
@@ -1091,11 +1102,11 @@ export function detectHighlights(
   // Score each sentence
   const scored = sentences.map((s, i) => {
     let score = 1.0;
-    const lower = s.text.toLowerCase();
+    const normalizedText = s.text.replace(/\s+/g, " ").trim();
 
     // Hook words
     const hookCount = [...HOOK_WORDS].filter((w) =>
-      new RegExp(`\\b${w}\\b`, "i").test(lower),
+      new RegExp(`\\b${w}\\b`, "i").test(normalizedText),
     ).length;
     // Cap generic hooks so keyword stuffing cannot outrank ministry moments.
     score *= 1 + Math.min(3, hookCount) * (HOOK_WORD_BOOST - 1);
@@ -1120,13 +1131,13 @@ export function detectHighlights(
     if (posRatio > 0.85) score *= POSITION_BEGINNING_BOOST;
 
     // Add church signals after generic boosts so each carries more weight.
-    if (SCRIPTURE_BOOK.test(s.text)) score += 5;
-    if (/\b\d{1,3}\s*:\s*\d{1,3}(?:\s*[-–]\s*\d{1,3})?\b/.test(s.text)) score += 6;
-    if (ALTAR_CALL.test(s.text)) score += 8;
-    if (TESTIMONY.test(s.text)) score += 6;
-    if (AUDIENCE_PEAK.test(s.text)) score += 6;
+    if (SCRIPTURE_BOOK.test(normalizedText) || AMBIGUOUS_SCRIPTURE_BOOK.test(normalizedText)) score += 5;
+    if (CHAPTER_VERSE.test(normalizedText)) score += 6;
+    if (ALTAR_CALL.test(normalizedText)) score += 8;
+    if (TESTIMONY.test(normalizedText)) score += 6;
+    if (AUDIENCE_PEAK.test(normalizedText)) score += 6;
 
-    return { ...s, score, wordCount };
+    return { ...s, score, wordCount, index: i };
   });
 
   // Sort by score descending, pick top N, ensure min duration
@@ -1141,22 +1152,23 @@ export function detectHighlights(
     let endMs = s.endMs;
     let text = s.text;
 
+    let last = s.index;
+    let first = s.index;
     while (endMs - startMs < minDur) {
-      // Try extending forward
-      const nextSentence = sentences.find(
-        (sent) => sent.startMs >= endMs - 100 && sent.startMs <= endMs + 500,
-      );
-      if (nextSentence && endMs - startMs < maxDur) {
-        endMs = nextSentence.endMs;
-        text += " " + nextSentence.text;
+      const next = sentences[last + 1];
+      const prev = sentences[first - 1];
+      if (next && next.startMs - endMs <= 5000 && next.endMs - startMs <= maxDur) {
+        last++;
+        endMs = next.endMs;
+      } else if (prev && startMs - prev.endMs <= 5000 && endMs - prev.startMs <= maxDur) {
+        first--;
+        startMs = prev.startMs;
       } else break;
     }
-
-    // Cap at max duration
-    if (endMs - startMs > maxDur) endMs = startMs + maxDur;
-
-    // Skip if too short
-    if (endMs - startMs < minDur * 0.5) continue;
+    // Never cut an indivisible transcript segment in half to hit a duration.
+    if (endMs - startMs < minDur || endMs - startMs > maxDur) continue;
+    if (selected.some(c => startMs < c.endMs && endMs > c.startMs)) continue;
+    text = captions.filter(c => c.startMs >= startMs && c.endMs <= endMs).map(c => c.text).join(" ");
 
     selected.push({ startMs, endMs, text: text.trim(), score: s.score });
   }
@@ -1164,12 +1176,26 @@ export function detectHighlights(
   return selected;
 }
 
+export function validateClipOptions(opts?: { clipCount?: number; minDuration?: number; maxDuration?: number }) {
+  const clipCount = opts?.clipCount ?? 5;
+  const minDuration = opts?.minDuration ?? 15;
+  const maxDuration = opts?.maxDuration ?? 60;
+  if (!Number.isInteger(clipCount) || clipCount < 1 || clipCount > 20 ||
+      !Number.isFinite(minDuration) || !Number.isFinite(maxDuration) ||
+      minDuration <= 0 || minDuration > maxDuration || maxDuration > 180) {
+    throw new Error("Choose 1–20 clips and durations with 0 < minimum <= maximum <= 180 seconds.");
+  }
+  return { clipCount, minDuration, maxDuration };
+}
+
 export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
+  validateClipOptions(opts);
+  if (!!opts.url === !!opts.localFilePath) throw new Error("Provide exactly one URL or uploaded file.");
+  if (opts.localFilePath && !existsSync(opts.localFilePath)) throw new Error("Uploaded video no longer exists.");
   const { randomUUID } = await import("crypto");
-  const { existsSync, mkdirSync } = await import("fs");
   const { join, dirname } = await import("path");
 
-  const tmpDir = join(
+  const tmpDir = opts.workDir ?? join(
     process.cwd(),
     "data",
     "renders",
@@ -1178,22 +1204,27 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
   mkdirSync(tmpDir, { recursive: true });
 
   // Step 1: Download video
-  const sourcePath = join(tmpDir, "source.mp4");
+  const sourcePath = opts.localFilePath ?? join(tmpDir, "source.mp4");
+  try {
+  if (!opts.localFilePath) {
   const dlProc = Bun.spawn(
     [
-      "yt-dlp",
+      process.env.YTDLP_PATH || "yt-dlp",
       "-f",
       "best[ext=mp4]/best",
       "--no-playlist",
+      "--max-filesize", "4G",
       "-o",
       sourcePath,
-      opts.url,
+      "--",
+      opts.url!,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "ignore", stderr: "pipe" },
   );
   const dlErr = await new Response(dlProc.stderr).text();
   if ((await dlProc.exited) !== 0) {
     throw new Error(`Download failed: ${dlErr.slice(-500)}`);
+  }
   }
 
   // Step 2: Extract audio for transcription
@@ -1212,10 +1243,11 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
       "4",
       audioPath,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "ignore", stderr: "pipe" },
   );
+  const audioError = await new Response(audioProc.stderr).text();
   if ((await audioProc.exited) !== 0) {
-    throw new Error("Failed to extract audio");
+    throw new Error(`Failed to extract audio: ${audioError.slice(-300)}`);
   }
 
   // Step 3: Transcribe with whisper
@@ -1245,11 +1277,17 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
     const startSec = h.startMs / 1000;
     const durSec = (h.endMs - h.startMs) / 1000;
 
+    if (opts.extractClips === false) {
+      clips.push({ path: sourcePath, ...h, suggestedTitle: "" });
+      continue;
+    }
+
     const clipProc = Bun.spawn([
       ffmpegPath, "-y", "-ss", String(startSec), "-i",
       sourcePath, "-t", String(durSec), "-c", "copy", clipPath,
     ], { stdout: "pipe", stderr: "pipe" });
 
+    const clipError = await new Response(clipProc.stderr).text();
     if ((await clipProc.exited) === 0 && existsSync(clipPath)) {
       clips.push({
         path: clipPath,
@@ -1259,10 +1297,14 @@ export async function autoClip(opts: AutoClipOpts): Promise<AutoClipResult> {
         score: h.score,
         suggestedTitle: "",
       });
-    }
+    } else throw new Error(`Clip extraction failed: ${clipError.slice(-300)}`);
   }
 
-  return { sourcePath, clips, allCaptions: captions };
+  return { sourcePath, clips, allCaptions: captions, workDir: tmpDir };
+  } catch (error) {
+    rmSync(tmpDir, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export interface FaceKeyframe {
@@ -1342,10 +1384,11 @@ export async function detectSilence(
 
   const threshold = opts.threshold ?? -30;
   const minDur = opts.minDuration ?? 0.5;
+  if (!Number.isFinite(threshold) || !Number.isFinite(minDur) || minDur <= 0) throw new Error("Invalid silence settings.");
 
   const proc = Bun.spawn(
     [
-      "ffmpeg",
+      process.env.FFMPEG_PATH || "ffmpeg",
       "-i",
       opts.inputPath,
       "-af",
@@ -1358,7 +1401,7 @@ export async function detectSilence(
   );
 
   const stderr = await new Response(proc.stderr).text();
-  await proc.exited;
+  if (await proc.exited !== 0) throw new Error(`Silence detection failed: ${stderr.slice(-300)}`);
 
   const segments: SilenceSegment[] = [];
   const lines = stderr.split("\n");
@@ -1406,10 +1449,11 @@ export async function removeSilence(
   if (silence.length === 0) {
     // No silence — just copy
     const proc = Bun.spawn(
-      ["ffmpeg", "-y", "-i", opts.inputPath, "-c", "copy", opts.outputPath],
+      [process.env.FFMPEG_PATH || "ffmpeg", "-y", "-i", opts.inputPath, "-c", "copy", opts.outputPath],
       { stdout: "pipe", stderr: "pipe" },
     );
-    await proc.exited;
+    const error = await new Response(proc.stderr).text();
+    if (await proc.exited !== 0) throw new Error(`Silence copy failed: ${error.slice(-300)}`);
     return { outputPath: opts.outputPath, removedMs: 0, segments: 0 };
   }
 
@@ -1451,48 +1495,16 @@ export async function removeSilence(
   const removedMs =
     totalMs - speaking.reduce((s, seg) => s + (seg.endMs - seg.startMs), 0);
 
-  // Use ffmpeg complex filter to cut and concatenate speaking segments
-  // with crossfade between them
+  // One input; trim each retained range and explicitly map both outputs.
   const ffmpegBin = process.env.FFMPEG_PATH || "ffmpeg";
-  const filterInputs: string[] = [];
-  const filterParts: string[] = [];
-
-  for (let i = 0; i < speaking.length; i++) {
-    const seg = speaking[i];
-    const startSec = seg.startMs / 1000;
-    const durSec = (seg.endMs - seg.startMs) / 1000;
-    filterInputs.push(`-ss ${startSec} -t ${durSec} -i ${opts.inputPath}`);
-    filterParts.push(`[${i}:v][${i}:a]`);
-  }
-
-  // Concat all segments
-  const concatLabel = speaking.length > 1 ? `[vconcat]` : `[vout]`;
-  if (speaking.length > 1) {
-    filterParts.push(`concat=n=${speaking.length}:v=1:a=1${concatLabel}`);
-  }
-
-  const filterComplex = filterParts.join(" ");
-  const outputLabel = speaking.length > 1 ? "[vconcat]" : "[vout]";
-
-  const args = [
-    "-y",
-    ...filterInputs.join(" ").split(" "),
-    "-filter_complex",
-    filterComplex,
-    "-map",
-    outputLabel,
-    "-c:v",
-    "libx264",
-    "-preset",
-    "fast",
-    "-crf",
-    "23",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    opts.outputPath,
-  ];
+  const filters = speaking.flatMap((seg, i) => [
+    `[0:v]trim=start=${seg.startMs / 1000}:end=${seg.endMs / 1000},setpts=PTS-STARTPTS[v${i}]`,
+    `[0:a]atrim=start=${seg.startMs / 1000}:end=${seg.endMs / 1000},asetpts=PTS-STARTPTS[a${i}]`,
+  ]);
+  filters.push(speaking.map((_, i) => `[v${i}][a${i}]`).join("") + `concat=n=${speaking.length}:v=1:a=1[vout][aout]`);
+  const args = ["-y", "-i", opts.inputPath, "-filter_complex", filters.join(";"),
+    "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "fast",
+    "-crf", "23", "-c:a", "aac", "-b:a", "128k", opts.outputPath];
 
   const proc = Bun.spawn([ffmpegBin, ...args], {
     stdout: "pipe",
@@ -1527,3 +1539,18 @@ export type {
   MultimodalHighlight,
   MultimodalClipResult,
 } from "./multimodal-clip";
+
+export { detectBeats, snapToBeat, getBeatsInRange, calculateCutDensity } from "./beat-detection";
+export { analyzeAllVideos, findBestSceneForSection } from "./scene-analysis";
+export { analyzeStemEnergy, matchCameraToStem } from "./camera-switching";
+export { isDemucsAvailable, analyzeMultiStem } from "./stem-separation";
+export { concatWithTransitions, selectTransitionForEnergy, TRANSITION_PRESETS } from "./transitions";
+export { generateBRollEvents, buildBRollFilter, selectBRollBeats } from "./broll-injection";
+export { reframeVideo } from "./face-reframe";
+export { enhanceSpeech } from "./speech-enhance";
+export { searchStockFootage, getStockBRoll } from "./stock-footage";
+export { exportTimeline } from "./timeline-export";
+export { publishVideo } from "./social-publish";
+export { createSplitScreen } from "./split-screen";
+export { runBatchRender } from "./batch-render";
+export { detectSilence as analyzeSilence, removeSilence as editSilence } from "./silence-removal";

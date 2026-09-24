@@ -1,4 +1,5 @@
 import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
+import ClipReview from "./ClipReview";
 
 const API = "/api";
 
@@ -36,6 +37,7 @@ interface Template {
   desc: string;
   category: string;
   icon: string;
+  pipeline?: "sermon_clip" | "podcast_clip";
   defaults: Record<string, any>;
   fields: {
     key: string;
@@ -60,6 +62,14 @@ interface CaptionEntry {
 }
 
 export default function App() {
+  const [needsLogin, setNeedsLogin] = createSignal(false);
+  const [loginKey, setLoginKey] = createSignal("");
+  const [review, setReview] = createSignal<any>(null);
+  const [batchHistory, setBatchHistory] = createSignal<any[]>([]);
+  async function loadBatches() {
+    const res = await fetch(`${API}/batches`);
+    if (res.ok) setBatchHistory(await res.json());
+  }
   // Tab navigation
   const [activeTab, setActiveTab] = createSignal<"create" | "projects" | "clients">("create");
   
@@ -233,7 +243,6 @@ export default function App() {
   const [scriptStyle, setScriptStyle] = createSignal<string>("motivational");
   const [scriptDuration, setScriptDuration] = createSignal(30);
   // Opt-in only — defaults to false every session, never auto-enabled.
-  const [ragebaitHook, setRagebaitHook] = createSignal(false);
   const [scriptLoading, setScriptLoading] = createSignal(false);
   const [generatedScript, setGeneratedScript] = createSignal<{
     hook: string;
@@ -262,7 +271,6 @@ export default function App() {
           topic: scriptTopic(),
           style: scriptStyle(),
           duration: scriptDuration(),
-          ragebaitHook: ragebaitHook(),
         }),
       });
       if (!res.ok) {
@@ -391,6 +399,7 @@ export default function App() {
       fetch(`${API}/analytics/summary`),
       fetch(`${API}/post-queue`),
     ]);
+    if (projRes.status === 401) { setNeedsLogin(true); return; }
     if (projRes.ok) setProjects(await projRes.json());
     if (tplRes.ok) setTemplates(await tplRes.json());
     if (voiceRes.ok) setVoices(await voiceRes.json());
@@ -399,6 +408,7 @@ export default function App() {
     if (analyticsRes.ok) setAnalyticsData(await analyticsRes.json());
     if (queueRes.ok) setPostQueue(await queueRes.json());
     loadClients();
+    void loadBatches();
   });
 
   onCleanup(() => {
@@ -407,10 +417,11 @@ export default function App() {
   });
 
   function selectTemplate(tpl: Template) {
+    setUploadedPath(""); setUploadFile(null);
     setSelectedTpl(tpl);
     const fields: Record<string, string> = {};
     for (const f of tpl.fields) {
-      fields[f.key] = f.default ?? "";
+      fields[f.key] = f.default ?? tpl.defaults[f.key] ?? "";
     }
     setTplFields(fields);
     setName(`${tpl.name} - ${new Date().toLocaleDateString()}`);
@@ -496,6 +507,22 @@ export default function App() {
     try {
       const fields = tplFields();
       const settings: any = { ...tpl.defaults, ...fields };
+      if (tpl.pipeline) {
+        if (uploading()) throw new Error("Wait for the upload to finish.");
+        const localFilePath = uploadedPath();
+        if (!localFilePath && !settings.url) throw new Error("Upload a video or enter its URL.");
+        const res = await fetch(`${API}/batch-clip`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          ...settings, url: localFilePath ? undefined : settings.url, localFilePath: localFilePath || undefined,
+          templateId: tpl.pipeline, clientId: selectedProjectClientId() || undefined,
+          scriptureReference: settings.scriptureReference || settings.scripture,
+        }) });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setAutoClips([]); setDownloadBatchId(null); setReview(null);
+        setBatchId(data.batchId); pollBatch(data.batchId); void loadBatches();
+        toast("Queued for analysis. You’ll review excerpts before rendering.", "info");
+        return;
+      }
 
       // Handle Reddit URL import
       if (fields.redditUrl) {
@@ -871,27 +898,25 @@ export default function App() {
           completedClips: data.completedClips,
           status: data.status,
         });
-        if (data.status === "done") {
+        if (data.status === "review") {
+          clearInterval(batchPollId!); batchPollId = null;
+          setBatchStatus(null); setReview({ ...data, id });
+          void loadBatches();
+          return;
+        }
+        if (["done", "partial", "error", "interrupted"].includes(data.status)) {
           clearInterval(batchPollId!);
           batchPollId = null;
-          setAutoClips(data.clips ?? []);
+          setAutoClips((data.clips ?? []).filter((c: any) => !c.error && c.renderId));
           setDownloadBatchId(id);
           setBatchId(null);
           setBatchStatus(null);
-          toast(
-            `Batch complete — ${data.clips?.length ?? 0} clips ready`,
-            "ok",
-          );
+          toast(`${data.completedClips} clips ready${data.failedClips ? `; ${data.failedClips} failed` : ""}. ${data.error ?? ""}`, data.status === "done" ? "ok" : "err");
+          void loadBatches();
           const pRes = await fetch(`${API}/projects`);
           if (pRes.ok) setProjects(await pRes.json());
         }
-        if (data.status === "error") {
-          clearInterval(batchPollId!);
-          batchPollId = null;
-          setBatchId(null);
-          setBatchStatus(null);
-          toast(data.error || "Batch failed", "err");
-        }
+
       } catch {
         failures++;
         if (failures >= 5) {
@@ -1002,7 +1027,11 @@ export default function App() {
         <h1 class="text-2xl font-bold">
           <span class="text-brand">Crayo</span> Local
         </h1>
-        <p class="text-sm text-zinc-400 mt-1">AI short-form video generator</p>
+        <p class="text-sm text-zinc-400 mt-1">AI-assisted clips. Review the message, then render.</p>
+        <Show when={needsLogin()}><form class="mt-4 flex gap-2" onSubmit={async e => {
+          e.preventDefault(); const res = await fetch(`${API}/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: loginKey() }) });
+          if (res.ok) window.location.reload(); else toast("Incorrect local API key", "err");
+        }}><input type="password" placeholder="Local CRAYO_API_KEY" class="bg-zinc-800 p-2" value={loginKey()} onInput={e => setLoginKey(e.currentTarget.value)} /><button type="submit">Unlock local app</button></form></Show>
         <nav class="flex gap-1 mt-4">
           <For each={[
             { id: "create" as const, label: "Create" },
@@ -1084,6 +1113,12 @@ export default function App() {
                           </div>
                         </div>
                         <div class="flex items-center gap-2 shrink-0">
+                          <label class="text-sm cursor-pointer underline">Upload logo<input class="hidden" type="file" accept="image/png,image/jpeg,image/webp" onChange={async e => {
+                            const file = e.currentTarget.files?.[0]; if (!file) return;
+                            const data = new FormData(); data.append("logo", file); data.append("position", "bottom-right"); data.append("opacity", "0.8");
+                            try { const res = await fetch(`${API}/clients/${cl.id}/branding`, { method: "POST", body: data }); const result = await res.json(); if (!res.ok) throw new Error(result.error); toast("Logo saved for future clips", "ok"); }
+                            catch (error: any) { toast(error.message, "err"); }
+                          }} /></label>
                           <button
                             onClick={() => deliverForClient(cl.id, cl.name)}
                             disabled={deliveringClientId() === cl.id}
@@ -1158,18 +1193,6 @@ export default function App() {
                   class="w-full accent-brand"
                 />
               </div>
-              <label
-                class="flex items-center gap-2 text-sm text-zinc-300 select-none"
-                title="Off by default. Writes a curiosity-gap hook (implication, unanswered question) instead of a flat statement. Still bound by the same no-false-claims rules as every other style."
-              >
-                <input
-                  type="checkbox"
-                  checked={ragebaitHook()}
-                  onChange={(e) => setRagebaitHook(e.currentTarget.checked)}
-                  class="accent-brand w-4 h-4"
-                />
-                Ragebait / curiosity hook (opt-in)
-              </label>
               <button
                 onClick={generateScript}
                 disabled={scriptLoading() || !scriptTopic().trim()}
@@ -1514,7 +1537,7 @@ export default function App() {
                     />
                   </Show>
                   {/* Local mp4 upload — alternative to pasting a URL for Auto Clip & Standup Comedy */}
-                  <Show when={(selectedTpl()!.id === "auto_clip" || selectedTpl()!.id === "standup_comedy") && field.key === "url"}>
+                  <Show when={(!!selectedTpl()!.pipeline || selectedTpl()!.id === "standup_comedy") && field.key === "url"}>
                     <div class="mt-2 flex items-center gap-3">
                       <span class="text-xs text-zinc-500">or</span>
                       <label class="flex items-center gap-2 text-sm bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 cursor-pointer hover:border-brand">
@@ -1821,6 +1844,22 @@ export default function App() {
         </Show>
 
         {/* Batch Progress */}
+        <section class="mb-6 space-y-2">
+          <h2 class="font-semibold">Saved clip batches</h2>
+          <button class="text-sm underline" onClick={loadBatches}>Refresh</button>
+          <For each={batchHistory().slice().reverse().slice(0, 20)}>{b => <div class="text-sm flex flex-wrap gap-3">
+            <span>{new Date(b.createdAt).toLocaleString()} — {b.status}</span>
+            <button class="underline" onClick={() => { setReview(null); setBatchId(b.id); pollBatch(b.id); }}>Open</button>
+            <Show when={["error", "partial", "interrupted"].includes(b.status)}><button class="underline" onClick={async () => {
+              const res = await fetch(`${API}/batch/${b.id}/retry`, { method: "POST" });
+              const data = await res.json(); if (!res.ok) { toast(data.error, "err"); return; }
+              setBatchId(b.id); pollBatch(b.id); void loadBatches();
+            }}>Retry failed work</button></Show>
+          </div>}</For>
+        </section>
+        <Show when={review()} keyed>{r => <ClipReview batchId={r.id} candidates={r.candidates} transcript={r.transcript}
+          onApproved={() => { setReview(null); setBatchId(r.id); pollBatch(r.id); void loadBatches(); }}
+          onDiscard={() => { setReview(null); setBatchId(null); void loadBatches(); }} />}</Show>
         <Show when={batchStatus()}>
           <div class="bg-zinc-900 rounded-xl p-6 border border-zinc-800 mb-8">
             <div class="flex items-center justify-between mb-3">
@@ -1845,8 +1884,7 @@ export default function App() {
               />
             </div>
             <p class="text-xs text-zinc-500">
-              Rendering clip {batchStatus()!.completedClips + 1} of{" "}
-              {batchStatus()!.totalClips} — this may take a few minutes
+              {batchStatus()!.status} — {batchStatus()!.completedClips} successful clips so far
             </p>
           </div>
         </Show>
@@ -1863,7 +1901,7 @@ export default function App() {
               ({autoClips().length} clips)
             </h2>
             <Show when={downloadBatchId()}>
-              <a class="inline-block mb-4 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500" href={`${API}/renders/batch/${downloadBatchId()}/zip`} download>Download All as ZIP</a>
+              <a class="inline-block mb-4 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500" href={`${API}/renders/batch/${downloadBatchId()}/zip`} download="crayola-clips.zip">Download All as ZIP</a>
             </Show>
             <div class="space-y-3">
               <For each={autoClips()}>
@@ -1906,6 +1944,7 @@ export default function App() {
                         {Math.round(clip.endMs / 1000)}s{" · "}Score:{" "}
                         {clip.score.toFixed(1)}
                       </p>
+                      <For each={clip.warnings ?? []}>{warning => <p class="text-xs text-amber-400">{String(warning)}</p>}</For>
                     </div>
                     <a
                       href={`${API}/renders/${clip.renderId}/download`}
@@ -1946,54 +1985,7 @@ export default function App() {
               </span>
               <Show when={activeRender()!.status === "done"}>
                 <div class="ml-auto flex gap-2">
-                  <select
-                    id="post-platform"
-                    class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-white"
-                  >
-                    <option value="tiktok">TikTok</option>
-                    <option value="reels">Instagram Reels</option>
-                    <option value="shorts">YouTube Shorts</option>
-                  </select>
-                  <button
-                    onClick={async () => {
-                      const platform =
-                        (
-                          document.getElementById(
-                            "post-platform",
-                          ) as HTMLSelectElement
-                        )?.value || "tiktok";
-                      try {
-                        const res = await fetch(`${API}/post-now`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({
-                            renderId: activeRender()!.id,
-                            platform,
-                          }),
-                        });
-                        const data = await res.json();
-                        if (data.postUrl) {
-                          toast(`Queued for ${platform}!`, "ok");
-                          setPostQueue([
-                            ...postQueue(),
-                            {
-                              id: data.id,
-                              platform,
-                              status: "queued",
-                              postUrl: data.postUrl,
-                            },
-                          ]);
-                        } else {
-                          toast(data.error || "Failed to queue", "err");
-                        }
-                      } catch (err: any) {
-                        toast(err.message, "err");
-                      }
-                    }}
-                    class="bg-brand hover:bg-red-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium transition"
-                  >
-                    📤 Post
-                  </button>
+                  <span class="text-xs text-zinc-400">Download, then post manually.</span>
                   <a
                     href={`${API}/renders/${activeRender()!.id}/download`}
                     class="bg-green-600 hover:bg-green-700 text-white px-4 py-1.5 rounded-lg text-sm font-medium transition"
